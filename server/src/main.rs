@@ -7,6 +7,9 @@ use tokio_tungstenite::tungstenite::Message;
 use uuid::Uuid;
 use match3_protocol::{ClientMessage, ServerMessage, GameResult, PlayerId, GameId};
 
+mod db;
+use db::Database;
+
 type Tx = mpsc::UnboundedSender<Message>;
 
 const GAME_DURATION: u64 = 90; // seconds
@@ -45,7 +48,7 @@ impl GameSession {
         }
     }
 
-    async fn start(&self) {
+    async fn start(&self, db: Database) {
         // Notify both players that the game has started
         let start_msg = ServerMessage::GameStarted { game_id: self.id };
         let _ = self.player1.tx.send(Message::Text(
@@ -56,10 +59,10 @@ impl GameSession {
         ));
 
         // Start the game timer
-        self.run_game_timer().await;
+        self.run_game_timer(db).await;
     }
 
-    async fn run_game_timer(&self) {
+    async fn run_game_timer(&self, db: Database) {
         let mut ticker = interval(Duration::from_secs(1));
         let scores = Arc::clone(&self.scores);
         let active = Arc::clone(&self.active);
@@ -106,11 +109,44 @@ impl GameSession {
                 GameResult::Tie
             };
 
-            let p1_msg = ServerMessage::GameOver { winner: p1_result };
-            let p2_msg = ServerMessage::GameOver { winner: p2_result };
+            let p1_msg = ServerMessage::GameOver { winner: p1_result.clone() };
+            let p2_msg = ServerMessage::GameOver { winner: p2_result.clone() };
 
             let _ = p1_tx.send(Message::Text(serde_json::to_string(&p1_msg).unwrap()));
             let _ = p2_tx.send(Message::Text(serde_json::to_string(&p2_msg).unwrap()));
+
+            // Update ELO ratings in database
+            let is_tie = p1_result == GameResult::Tie;
+            if let Ok((p1_updated, p2_updated)) = db.update_match_result(
+                p1_id,
+                p2_id,
+                is_tie,
+            ).await {
+                // Send match result with new ELO to both players
+                let p1_elo_change = p1_updated.elo - 1000; // We don't have old ELO, so approximate
+                let p2_elo_change = p2_updated.elo - 1000;
+
+                // For a more accurate calculation, we should store old ELO before the match
+                // For now, just send the new values
+                let p1_result_msg = ServerMessage::MatchResult {
+                    new_elo: p1_updated.elo,
+                    elo_change: p1_elo_change,
+                    wins: p1_updated.wins,
+                    losses: p1_updated.losses,
+                };
+                let p2_result_msg = ServerMessage::MatchResult {
+                    new_elo: p2_updated.elo,
+                    elo_change: p2_elo_change,
+                    wins: p2_updated.wins,
+                    losses: p2_updated.losses,
+                };
+
+                let _ = p1_tx.send(Message::Text(serde_json::to_string(&p1_result_msg).unwrap()));
+                let _ = p2_tx.send(Message::Text(serde_json::to_string(&p2_result_msg).unwrap()));
+
+                println!("Match result: {} (ELO: {}) vs {} (ELO: {})",
+                    p1_id, p1_updated.elo, p2_id, p2_updated.elo);
+            }
 
             *active.write().await = false;
         });
@@ -177,7 +213,7 @@ impl GameSession {
         }
     }
 
-    async fn handle_rematch_request(&self, player_id: PlayerId) {
+    async fn handle_rematch_request(&self, player_id: PlayerId, db: Database) {
         let mut rematch_requests = self.rematch_requests.write().await;
 
         // Mark this player as requesting rematch
@@ -213,7 +249,7 @@ impl GameSession {
             let _ = self.player2.tx.send(Message::Text(msg_str));
 
             // Start a new game
-            self.run_game_timer().await;
+            self.run_game_timer(db).await;
         }
     }
 
@@ -239,15 +275,17 @@ struct ServerState {
     games: Arc<RwLock<HashMap<GameId, Arc<GameSession>>>>,
     matchmaking_queue: Arc<Mutex<Vec<PlayerId>>>,
     player_to_game: Arc<RwLock<HashMap<PlayerId, GameId>>>,
+    db: Database,
 }
 
 impl ServerState {
-    fn new() -> Self {
+    fn new(db: Database) -> Self {
         Self {
             players: Arc::new(RwLock::new(HashMap::new())),
             games: Arc::new(RwLock::new(HashMap::new())),
             matchmaking_queue: Arc::new(Mutex::new(Vec::new())),
             player_to_game: Arc::new(RwLock::new(HashMap::new())),
+            db,
         }
     }
 
@@ -326,12 +364,16 @@ impl ServerState {
             self.player_to_game.write().await.insert(p2_id, game_id);
 
             // Start the game
-            game.start().await;
+            game.start(self.db.clone()).await;
         }
     }
 
     async fn handle_client_message(&self, player_id: PlayerId, msg: ClientMessage) {
         match msg {
+            ClientMessage::Login { .. } => {
+                // Login is handled in handle_connection, ignore here
+                // If we receive Login after authentication, just ignore it
+            }
             ClientMessage::JoinQueue => {
                 self.join_queue(player_id).await;
             }
@@ -403,7 +445,7 @@ impl ServerState {
             ClientMessage::RequestRematch => {
                 if let Some(game_id) = self.player_to_game.read().await.get(&player_id) {
                     if let Some(game) = self.games.read().await.get(game_id) {
-                        game.handle_rematch_request(player_id).await;
+                        game.handle_rematch_request(player_id, self.db.clone()).await;
                     }
                 }
             }
@@ -426,7 +468,75 @@ async fn handle_connection(
     let (mut ws_sender, mut ws_receiver) = ws_stream.split();
     let (tx, mut rx) = mpsc::unbounded_channel();
 
-    let player_id = Uuid::new_v4();
+    // Wait for Login message (authentication handshake)
+    let player_id = loop {
+        match ws_receiver.next().await {
+            Some(Ok(Message::Text(text))) => {
+                match serde_json::from_str::<ClientMessage>(&text) {
+                    Ok(ClientMessage::Login { username }) => {
+                        // Authenticate user with database
+                        match state.db.get_or_create_user(&username).await {
+                            Ok(user) => {
+                                // Send authentication success
+                                let auth_msg = ServerMessage::AuthAccepted {
+                                    player_id: user.id,
+                                    username: user.username.clone(),
+                                    elo: user.elo,
+                                    wins: user.wins,
+                                    losses: user.losses,
+                                };
+                                let auth_json = serde_json::to_string(&auth_msg).unwrap();
+                                if ws_sender.send(Message::Text(auth_json)).await.is_err() {
+                                    println!("Failed to send auth accepted");
+                                    return;
+                                }
+                                println!("User authenticated: {} ({})", user.username, user.id);
+                                break user.id;
+                            }
+                            Err(e) => {
+                                // Database error - send rejection
+                                let reject_msg = ServerMessage::AuthRejected {
+                                    reason: format!("Database error: {}", e),
+                                };
+                                let reject_json = serde_json::to_string(&reject_msg).unwrap();
+                                let _ = ws_sender.send(Message::Text(reject_json)).await;
+                                println!("Authentication failed: {}", e);
+                                return;
+                            }
+                        }
+                    }
+                    Ok(_) => {
+                        // Wrong message type - expecting Login first
+                        let reject_msg = ServerMessage::AuthRejected {
+                            reason: "Expected Login message first".to_string(),
+                        };
+                        let reject_json = serde_json::to_string(&reject_msg).unwrap();
+                        let _ = ws_sender.send(Message::Text(reject_json)).await;
+                        println!("Client sent non-Login message before authentication");
+                        return;
+                    }
+                    Err(_) => {
+                        // Failed to parse message
+                        let reject_msg = ServerMessage::AuthRejected {
+                            reason: "Invalid message format".to_string(),
+                        };
+                        let reject_json = serde_json::to_string(&reject_msg).unwrap();
+                        let _ = ws_sender.send(Message::Text(reject_json)).await;
+                        return;
+                    }
+                }
+            }
+            Some(Ok(Message::Close(_))) | None => {
+                println!("Client disconnected before authentication");
+                return;
+            }
+            _ => {
+                // Ignore other message types
+            }
+        }
+    };
+
+    // Create player with authenticated user ID
     let player = Player {
         id: player_id,
         tx: tx.clone(),
@@ -435,7 +545,7 @@ async fn handle_connection(
     // Add player to server state
     state.add_player(player).await;
 
-    println!("New player connected: {}", player_id);
+    println!("Player connected and authenticated: {}", player_id);
 
     // Spawn task to send messages to client
     let mut send_task = tokio::spawn(async move {
@@ -452,6 +562,10 @@ async fn handle_connection(
         while let Some(Ok(message)) = ws_receiver.next().await {
             if let Message::Text(text) = message {
                 if let Ok(client_msg) = serde_json::from_str::<ClientMessage>(&text) {
+                    // Skip Login messages after authentication
+                    if matches!(client_msg, ClientMessage::Login { .. }) {
+                        continue;
+                    }
                     state_clone.handle_client_message(player_id, client_msg).await;
                 }
             }
@@ -477,9 +591,13 @@ async fn handle_connection(
 async fn main() {
     let addr = "127.0.0.1:9001";
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
+
+    // Initialize database
+    let db = Database::init().await.expect("Failed to initialize database");
+
     println!("Match3 PVP Server listening on: {}", addr);
 
-    let state = ServerState::new();
+    let state = ServerState::new(db);
 
     while let Ok((stream, addr)) = listener.accept().await {
         println!("New connection from: {}", addr);

@@ -7,6 +7,7 @@ pub type GameId = Uuid;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum ClientMessage {
+    Login { username: String },
     JoinQueue,
     SwapGems { row1: usize, col1: usize, row2: usize, col2: usize },
     ScoreUpdate { score: u32 },
@@ -20,6 +21,8 @@ pub enum ClientMessage {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum ServerMessage {
+    AuthAccepted { player_id: PlayerId, username: String, elo: i32, wins: u32, losses: u32 },
+    AuthRejected { reason: String },
     Connected { player_id: PlayerId },
     Queued { position: usize },
     MatchFound { game_id: GameId, opponent_id: PlayerId },
@@ -31,6 +34,7 @@ pub enum ServerMessage {
     OpponentActivatedSpecial { row: usize, col: usize },
     OpponentActivatedBooster { booster_id: u8 },
     GameOver { winner: GameResult },
+    MatchResult { new_elo: i32, elo_change: i32, wins: u32, losses: u32 },
     OpponentRequestedRematch,
     RematchAccepted,
     OpponentLeft,

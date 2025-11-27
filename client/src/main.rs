@@ -155,6 +155,7 @@ impl Gem {
 #[derive(PartialEq, Clone)]
 enum GameState {
     Menu,
+    Login,
     Connecting,
     WaitingForMatch,
     Playing,
@@ -204,6 +205,12 @@ struct Game {
     opponent_requested_rematch: bool, // Whether opponent requested rematch
     disconnect_reason: Option<String>, // Reason for disconnect (if any)
     network_bridge: Option<NetworkBridge>, // WebSocket communication bridge
+    // User account info
+    username: String,          // Player's username
+    pending_username: String,  // Username being typed in login screen
+    elo: i32,                  // Player's ELO rating
+    wins: u32,                 // Total wins
+    losses: u32,               // Total losses
 }
 
 impl Game {
@@ -233,6 +240,11 @@ impl Game {
             opponent_requested_rematch: false,
             disconnect_reason: None,
             network_bridge: None,
+            username: String::new(),
+            pending_username: String::new(),
+            elo: 1000,
+            wins: 0,
+            losses: 0,
         };
         game.initialize_board();
         game
@@ -440,6 +452,29 @@ impl Game {
 
     fn handle_server_message(&mut self, msg: ServerMessage) {
         match msg {
+            ServerMessage::AuthAccepted { player_id, username, elo, wins, losses } => {
+                println!("Authentication successful! Welcome {}", username);
+                self.username = username;
+                self.elo = elo;
+                self.wins = wins;
+                self.losses = losses;
+                // Join queue automatically after authentication
+                if let Some(bridge) = &self.network_bridge {
+                    bridge.send(ClientMessage::JoinQueue);
+                }
+                self.state = GameState::WaitingForMatch;
+            }
+            ServerMessage::AuthRejected { reason } => {
+                println!("Authentication failed: {}", reason);
+                self.disconnect_reason = Some(format!("Auth failed: {}", reason));
+                self.state = GameState::Login;
+            }
+            ServerMessage::MatchResult { new_elo, elo_change, wins, losses } => {
+                self.elo = new_elo;
+                self.wins = wins;
+                self.losses = losses;
+                println!("Match result: ELO {} ({:+}), W/L: {}/{}", new_elo, elo_change, wins, losses);
+            }
             ServerMessage::Connected { player_id } => {
                 println!("Connected with player ID: {}", player_id);
             }
@@ -1290,6 +1325,7 @@ impl Game {
 
         match self.state {
             GameState::Menu => self.draw_menu(),
+            GameState::Login => self.draw_login(),
             GameState::Connecting => self.draw_connecting(),
             GameState::WaitingForMatch => self.draw_waiting(),
             GameState::Playing => self.draw_game(),
@@ -1337,6 +1373,72 @@ impl Game {
             18.0,
             LIGHTGRAY,
         );
+    }
+
+    fn draw_login(&self) {
+        let screen_width = screen_width();
+        let screen_height = screen_height();
+
+        draw_text(
+            "ENTER USERNAME",
+            screen_width / 2.0 - 130.0,
+            screen_height / 2.0 - 100.0,
+            40.0,
+            WHITE,
+        );
+
+        // Display error message if there is one
+        if let Some(ref reason) = self.disconnect_reason {
+            draw_text(
+                reason,
+                screen_width / 2.0 - 150.0,
+                screen_height / 2.0 - 50.0,
+                20.0,
+                RED,
+            );
+        }
+
+        // Username input box
+        let input_x = screen_width / 2.0 - 150.0;
+        let input_y = screen_height / 2.0 - 30.0;
+        let input_width = 300.0;
+        let input_height = 50.0;
+
+        draw_rectangle(input_x, input_y, input_width, input_height, DARKGRAY);
+        draw_rectangle_lines(input_x, input_y, input_width, input_height, 2.0, WHITE);
+
+        // Display username being typed
+        let display_text = if self.pending_username.is_empty() {
+            "Type your username..."
+        } else {
+            &self.pending_username
+        };
+        let text_color = if self.pending_username.is_empty() { GRAY } else { WHITE };
+        draw_text(display_text, input_x + 10.0, input_y + 33.0, 25.0, text_color);
+
+        // Continue button (only enabled if username is not empty)
+        let button_x = screen_width / 2.0 - 100.0;
+        let button_y = screen_height / 2.0 + 50.0;
+        let button_enabled = !self.pending_username.is_empty();
+        let button_color = if button_enabled { GREEN } else { GRAY };
+
+        draw_rectangle(button_x, button_y, 200.0, 50.0, button_color);
+        draw_text("CONTINUE", button_x + 40.0, button_y + 33.0, 25.0, WHITE);
+
+        // Instructions
+        draw_text(
+            "Press ENTER or click CONTINUE",
+            screen_width / 2.0 - 140.0,
+            screen_height / 2.0 + 130.0,
+            18.0,
+            LIGHTGRAY,
+        );
+
+        // Back button
+        let back_x = screen_width / 2.0 - 100.0;
+        let back_y = screen_height / 2.0 + 170.0;
+        draw_rectangle(back_x, back_y, 200.0, 40.0, Color::from_rgba(100, 100, 100, 255));
+        draw_text("BACK", back_x + 75.0, back_y + 27.0, 20.0, WHITE);
     }
 
     fn draw_connecting(&self) {
@@ -1824,10 +1926,18 @@ async fn main() {
             // Attempt to connect to server
             if let Some(bridge) = connect_to_server().await {
                 game.set_network_bridge(bridge);
+                // Send Login message immediately after connecting
+                if let Some(network_bridge) = &game.network_bridge {
+                    network_bridge.send(ClientMessage::Login {
+                        username: game.username.clone(),
+                    });
+                }
+                // Wait for AuthAccepted/AuthRejected in handle_server_message
             } else {
                 println!("Failed to connect - falling back to offline mode");
                 game.network_mode = NetworkMode::Offline;
-                game.state = GameState::Menu;
+                game.state = GameState::Login;
+                game.disconnect_reason = Some("Connection failed".to_string());
             }
             connecting = false;
         }
@@ -1855,7 +1965,34 @@ async fn main() {
                     let online_y = screen_height / 2.0 + 50.0;
                     if mouse_x >= online_x && mouse_x <= online_x + 200.0
                         && mouse_y >= online_y && mouse_y <= online_y + 50.0 {
-                        game.start_game(true);
+                        game.state = GameState::Login;
+                        game.pending_username.clear();
+                        game.disconnect_reason = None;
+                    }
+                }
+                GameState::Login => {
+                    let screen_width = screen_width();
+                    let screen_height = screen_height();
+
+                    // Continue button
+                    let button_x = screen_width / 2.0 - 100.0;
+                    let button_y = screen_height / 2.0 + 50.0;
+                    if !game.pending_username.is_empty()
+                        && mouse_x >= button_x && mouse_x <= button_x + 200.0
+                        && mouse_y >= button_y && mouse_y <= button_y + 50.0 {
+                        // Submit username and transition to Connecting
+                        game.username = game.pending_username.clone();
+                        game.state = GameState::Connecting;
+                        game.network_mode = NetworkMode::Online;
+                    }
+
+                    // Back button
+                    let back_x = screen_width / 2.0 - 100.0;
+                    let back_y = screen_width / 2.0 + 170.0;
+                    if mouse_x >= back_x && mouse_x <= back_x + 200.0
+                        && mouse_y >= back_y && mouse_y <= back_y + 40.0 {
+                        game.state = GameState::Menu;
+                        game.pending_username.clear();
                     }
                 }
                 GameState::Connecting => {
@@ -1887,6 +2024,36 @@ async fn main() {
                     }
                 }
                 _ => {}
+            }
+        }
+
+        // Handle keyboard input for login screen
+        if game.state == GameState::Login {
+            // Get character input
+            if let Some(character) = get_char_pressed() {
+                if character.is_alphanumeric() || character == '_' || character == '-' {
+                    if game.pending_username.len() < 20 {
+                        game.pending_username.push(character);
+                    }
+                }
+            }
+
+            // Handle backspace
+            if is_key_pressed(KeyCode::Backspace) {
+                game.pending_username.pop();
+            }
+
+            // Handle enter key to submit
+            if is_key_pressed(KeyCode::Enter) && !game.pending_username.is_empty() {
+                game.username = game.pending_username.clone();
+                game.state = GameState::Connecting;
+                game.network_mode = NetworkMode::Online;
+            }
+
+            // Handle escape to go back
+            if is_key_pressed(KeyCode::Escape) {
+                game.state = GameState::Menu;
+                game.pending_username.clear();
             }
         }
 
