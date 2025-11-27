@@ -1,6 +1,9 @@
 use macroquad::prelude::*;
 use ::rand::Rng;
 use match3_protocol::{ClientMessage, ServerMessage, GameResult};
+use tokio::sync::mpsc::{unbounded_channel, UnboundedSender, UnboundedReceiver};
+use futures::{StreamExt, SinkExt};
+use tokio_tungstenite::{connect_async, tungstenite::Message};
 
 const GRID_SIZE: usize = 8;
 const GEM_SIZE: f32 = 60.0;
@@ -164,6 +167,22 @@ enum NetworkMode {
     Online,     // Real multiplayer
 }
 
+// Network bridge for async WebSocket communication
+struct NetworkBridge {
+    to_server: UnboundedSender<ClientMessage>,
+    from_server: UnboundedReceiver<ServerMessage>,
+}
+
+impl NetworkBridge {
+    fn send(&self, msg: ClientMessage) {
+        let _ = self.to_server.send(msg);
+    }
+
+    fn try_recv(&mut self) -> Option<ServerMessage> {
+        self.from_server.try_recv().ok()
+    }
+}
+
 struct Game {
     grid: Vec<Vec<Option<Gem>>>,
     selected: Option<(usize, usize)>,
@@ -184,6 +203,7 @@ struct Game {
     requested_rematch: bool,   // Whether this player requested rematch
     opponent_requested_rematch: bool, // Whether opponent requested rematch
     disconnect_reason: Option<String>, // Reason for disconnect (if any)
+    network_bridge: Option<NetworkBridge>, // WebSocket communication bridge
 }
 
 impl Game {
@@ -212,6 +232,7 @@ impl Game {
             requested_rematch: false,
             opponent_requested_rematch: false,
             disconnect_reason: None,
+            network_bridge: None,
         };
         game.initialize_board();
         game
@@ -315,7 +336,16 @@ impl Game {
         self.time_remaining = GAME_DURATION;
         self.selected = None;
         self.pending_garbage = 0;
+        self.garbage_queue = 0;
+        self.garbage_timer = 0.0;
         self.initialize_board();
+    }
+
+    fn set_network_bridge(&mut self, bridge: NetworkBridge) {
+        // Send JoinQueue message immediately after connection
+        bridge.send(ClientMessage::JoinQueue);
+        self.network_bridge = Some(bridge);
+        self.state = GameState::WaitingForMatch;
     }
 
     fn update(&mut self, dt: f32) {
@@ -395,6 +425,82 @@ impl Game {
             }
             _ => {}
         }
+
+        // Handle incoming network messages
+        let mut messages = Vec::new();
+        if let Some(bridge) = &mut self.network_bridge {
+            while let Some(msg) = bridge.try_recv() {
+                messages.push(msg);
+            }
+        }
+        for msg in messages {
+            self.handle_server_message(msg);
+        }
+    }
+
+    fn handle_server_message(&mut self, msg: ServerMessage) {
+        match msg {
+            ServerMessage::Connected { player_id } => {
+                println!("Connected with player ID: {}", player_id);
+            }
+            ServerMessage::Queued { position } => {
+                println!("In queue, position: {}", position);
+            }
+            ServerMessage::MatchFound { game_id, opponent_id } => {
+                println!("Match found! Game ID: {}, Opponent: {}", game_id, opponent_id);
+            }
+            ServerMessage::GameStarted { game_id } => {
+                println!("Game started! ID: {}", game_id);
+                self.state = GameState::Playing;
+                self.score = 0;
+                self.opponent_score = 0;
+                self.time_remaining = GAME_DURATION;
+            }
+            ServerMessage::OpponentSwap { row1, col1, row2, col2 } => {
+                println!("Opponent swapped ({},{}) with ({},{})", row1, col1, row2, col2);
+                // We don't visualize opponent's board, so just log it
+            }
+            ServerMessage::ScoreUpdate { player_score, opponent_score } => {
+                self.score = player_score;
+                self.opponent_score = opponent_score;
+            }
+            ServerMessage::TimeUpdate { seconds_remaining } => {
+                self.time_remaining = seconds_remaining as f32;
+            }
+            ServerMessage::ReceiveGarbage { amount } => {
+                self.receive_garbage(amount);
+            }
+            ServerMessage::OpponentActivatedSpecial { row, col } => {
+                println!("Opponent activated special at ({},{})", row, col);
+            }
+            ServerMessage::OpponentActivatedBooster { booster_id } => {
+                println!("Opponent activated booster #{}", booster_id);
+            }
+            ServerMessage::GameOver { winner } => {
+                self.state = GameState::GameOver;
+                self.time_remaining = 0.0;
+                match winner {
+                    GameResult::Win => println!("You won!"),
+                    GameResult::Loss => println!("You lost!"),
+                    GameResult::Tie => println!("It's a tie!"),
+                }
+            }
+            ServerMessage::OpponentRequestedRematch => {
+                self.handle_opponent_rematch_request();
+            }
+            ServerMessage::RematchAccepted => {
+                self.handle_rematch_accepted();
+            }
+            ServerMessage::OpponentLeft => {
+                self.handle_opponent_left();
+            }
+            ServerMessage::OpponentDisconnected => {
+                self.handle_opponent_disconnected();
+            }
+            ServerMessage::Error { message } => {
+                println!("Server error: {}", message);
+            }
+        }
     }
 
     fn update_falling_gems(&mut self, dt: f32) {
@@ -471,6 +577,13 @@ impl Game {
     }
 
     fn swap_gems(&mut self, row1: usize, col1: usize, row2: usize, col2: usize) {
+        // Send swap message to server (online mode)
+        if self.network_mode == NetworkMode::Online {
+            if let Some(bridge) = &self.network_bridge {
+                bridge.send(ClientMessage::SwapGems { row1, col1, row2, col2 });
+            }
+        }
+
         // Check for special gem combos BEFORE swapping
         let gem1 = self.grid[row1][col1];
         let gem2 = self.grid[row2][col2];
@@ -663,12 +776,20 @@ impl Game {
 
         // Send garbage to opponent
         if garbage_to_send > 0 && self.network_mode == NetworkMode::Online {
-            // TODO: Send ClientMessage::SendGarbage
-            println!("Would send {} garbage to opponent", garbage_to_send);
+            if let Some(bridge) = &self.network_bridge {
+                bridge.send(ClientMessage::SendGarbage { amount: garbage_to_send });
+            }
         }
 
         if total_gems >= 4 {
             self.score += 20;
+        }
+
+        // Send score update to server
+        if self.network_mode == NetworkMode::Online {
+            if let Some(bridge) = &self.network_bridge {
+                bridge.send(ClientMessage::ScoreUpdate { score: self.score });
+            }
         }
 
         self.apply_gravity();
@@ -811,6 +932,13 @@ impl Game {
     }
 
     fn activate_special(&mut self, row: usize, col: usize) {
+        // Send activation message to server
+        if self.network_mode == NetworkMode::Online {
+            if let Some(bridge) = &self.network_bridge {
+                bridge.send(ClientMessage::ActivateSpecial { row, col });
+            }
+        }
+
         if let Some(gem) = self.grid[row][col] {
             match gem.gem_type {
                 GemType::Drill => {
@@ -1105,9 +1233,11 @@ impl Game {
         // Set cooldown
         self.boosters[booster_index].cooldown_remaining = 5.0;
 
-        // TODO: Send network message if online
+        // Send network message if online
         if self.network_mode == NetworkMode::Online {
-            println!("Would send ActivateBooster {{ booster_id: {} }}", booster.booster_type.id());
+            if let Some(bridge) = &self.network_bridge {
+                bridge.send(ClientMessage::ActivateBooster { booster_id: booster.booster_type.id() });
+            }
         }
     }
 
@@ -1601,6 +1731,76 @@ impl MatchType {
     }
 }
 
+// Async function to connect to WebSocket server
+async fn connect_to_server() -> Option<NetworkBridge> {
+    let url = "ws://127.0.0.1:9001";
+
+    println!("Attempting to connect to server at {}...", url);
+
+    match connect_async(url).await {
+        Ok((ws_stream, _)) => {
+            println!("Connected to server!");
+
+            let (write, read) = ws_stream.split();
+
+            // Create channels
+            let (to_server_tx, mut to_server_rx) = unbounded_channel::<ClientMessage>();
+            let (from_server_tx, from_server_rx) = unbounded_channel::<ServerMessage>();
+
+            // Spawn task to handle WebSocket communication
+            tokio::spawn(async move {
+                let mut write = write;
+                let mut read = read;
+
+                loop {
+                    tokio::select! {
+                        // Receive from game and send to server
+                        Some(msg) = to_server_rx.recv() => {
+                            let json = serde_json::to_string(&msg).unwrap();
+                            if write.send(Message::Text(json)).await.is_err() {
+                                println!("Failed to send message to server");
+                                break;
+                            }
+                        }
+
+                        // Receive from server and send to game
+                        result = read.next() => {
+                            match result {
+                                Some(Ok(Message::Text(text))) => {
+                                    if let Ok(msg) = serde_json::from_str::<ServerMessage>(&text) {
+                                        if from_server_tx.send(msg).is_err() {
+                                            println!("Failed to send message to game");
+                                            break;
+                                        }
+                                    }
+                                }
+                                Some(Ok(Message::Close(_))) | None => {
+                                    println!("Server disconnected");
+                                    break;
+                                }
+                                Some(Err(e)) => {
+                                    println!("WebSocket error: {}", e);
+                                    break;
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+            });
+
+            Some(NetworkBridge {
+                to_server: to_server_tx,
+                from_server: from_server_rx,
+            })
+        }
+        Err(e) => {
+            println!("Failed to connect to server: {}", e);
+            None
+        }
+    }
+}
+
 fn window_conf() -> Conf {
     Conf {
         window_title: "Brick City Wars - Match3 PVP".to_owned(),
@@ -1613,9 +1813,25 @@ fn window_conf() -> Conf {
 #[macroquad::main(window_conf)]
 async fn main() {
     let mut game = Game::new();
+    let mut connecting = false;
 
     loop {
         let dt = get_frame_time();
+
+        // Handle connection attempt
+        if game.state == GameState::Connecting && !connecting {
+            connecting = true;
+            // Attempt to connect to server
+            if let Some(bridge) = connect_to_server().await {
+                game.set_network_bridge(bridge);
+            } else {
+                println!("Failed to connect - falling back to offline mode");
+                game.network_mode = NetworkMode::Offline;
+                game.state = GameState::Menu;
+            }
+            connecting = false;
+        }
+
         game.update(dt);
 
         if is_mouse_button_pressed(MouseButton::Left) {
@@ -1640,10 +1856,10 @@ async fn main() {
                     if mouse_x >= online_x && mouse_x <= online_x + 200.0
                         && mouse_y >= online_y && mouse_y <= online_y + 50.0 {
                         game.start_game(true);
-                        // TODO: Initialize WebSocket connection
-                        println!("Online mode not fully implemented - starting offline");
-                        game.start_game(false);
                     }
+                }
+                GameState::Connecting => {
+                    // Waiting for connection - handled by async task
                 }
                 GameState::Playing => {
                     game.handle_click(mouse_x, mouse_y);
@@ -1660,8 +1876,9 @@ async fn main() {
                             // Request rematch in online mode
                             if !game.requested_rematch {
                                 game.requested_rematch = true;
-                                // TODO: Send ClientMessage::RequestRematch
-                                println!("Would send RequestRematch");
+                                if let Some(bridge) = &game.network_bridge {
+                                    bridge.send(ClientMessage::RequestRematch);
+                                }
                             }
                         } else {
                             // Go back to menu in offline mode
