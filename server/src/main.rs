@@ -27,6 +27,7 @@ struct GameSession {
     scores: Arc<RwLock<(u32, u32)>>, // (player1_score, player2_score)
     start_time: std::time::Instant,
     active: Arc<RwLock<bool>>,
+    rematch_requests: Arc<RwLock<(bool, bool)>>, // (player1_requested, player2_requested)
 }
 
 impl GameSession {
@@ -40,6 +41,7 @@ impl GameSession {
             scores: Arc::new(RwLock::new((0, 0))),
             start_time: std::time::Instant::now(),
             active: Arc::new(RwLock::new(true)),
+            rematch_requests: Arc::new(RwLock::new((false, false))),
         }
     }
 
@@ -172,6 +174,60 @@ impl GameSession {
             let _ = self.player2.tx.send(Message::Text(disconnect_str));
         } else {
             let _ = self.player1.tx.send(Message::Text(disconnect_str));
+        }
+    }
+
+    async fn handle_rematch_request(&self, player_id: PlayerId) {
+        let mut rematch_requests = self.rematch_requests.write().await;
+
+        // Mark this player as requesting rematch
+        if player_id == self.player1.id {
+            rematch_requests.0 = true;
+
+            // Notify opponent
+            let msg = ServerMessage::OpponentRequestedRematch;
+            let _ = self.player2.tx.send(Message::Text(serde_json::to_string(&msg).unwrap()));
+        } else {
+            rematch_requests.1 = true;
+
+            // Notify opponent
+            let msg = ServerMessage::OpponentRequestedRematch;
+            let _ = self.player1.tx.send(Message::Text(serde_json::to_string(&msg).unwrap()));
+        }
+
+        // Check if both players have requested rematch
+        if rematch_requests.0 && rematch_requests.1 {
+            // Reset rematch requests
+            rematch_requests.0 = false;
+            rematch_requests.1 = false;
+            drop(rematch_requests);
+
+            // Reset game state
+            *self.scores.write().await = (0, 0);
+            *self.active.write().await = true;
+
+            // Notify both players that rematch is accepted
+            let msg = ServerMessage::RematchAccepted;
+            let msg_str = serde_json::to_string(&msg).unwrap();
+            let _ = self.player1.tx.send(Message::Text(msg_str.clone()));
+            let _ = self.player2.tx.send(Message::Text(msg_str));
+
+            // Start a new game
+            self.run_game_timer().await;
+        }
+    }
+
+    async fn handle_leave(&self, player_id: PlayerId) {
+        *self.active.write().await = false;
+
+        let leave_msg = ServerMessage::OpponentLeft;
+        let leave_str = serde_json::to_string(&leave_msg).unwrap();
+
+        // Notify the other player
+        if player_id == self.player1.id {
+            let _ = self.player2.tx.send(Message::Text(leave_str));
+        } else {
+            let _ = self.player1.tx.send(Message::Text(leave_str));
         }
     }
 }
@@ -344,7 +400,19 @@ impl ServerState {
                     }
                 }
             }
+            ClientMessage::RequestRematch => {
+                if let Some(game_id) = self.player_to_game.read().await.get(&player_id) {
+                    if let Some(game) = self.games.read().await.get(game_id) {
+                        game.handle_rematch_request(player_id).await;
+                    }
+                }
+            }
             ClientMessage::LeaveGame => {
+                if let Some(game_id) = self.player_to_game.read().await.get(&player_id) {
+                    if let Some(game) = self.games.read().await.get(game_id) {
+                        game.handle_leave(player_id).await;
+                    }
+                }
                 self.remove_player(player_id).await;
             }
         }

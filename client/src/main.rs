@@ -175,9 +175,15 @@ struct Game {
     animation_timer: f32,
     network_mode: NetworkMode,
     pending_garbage: u8,
+    garbage_queue: u8,         // Incoming garbage waiting to drop
+    garbage_timer: f32,        // Time before queued garbage drops
     last_click_pos: Option<(usize, usize)>,
     last_click_time: f64,
     boosters: Vec<Booster>,
+    shake_timer: f32,          // Screen shake effect
+    requested_rematch: bool,   // Whether this player requested rematch
+    opponent_requested_rematch: bool, // Whether opponent requested rematch
+    disconnect_reason: Option<String>, // Reason for disconnect (if any)
 }
 
 impl Game {
@@ -193,6 +199,8 @@ impl Game {
             animation_timer: 0.0,
             network_mode: NetworkMode::Offline,
             pending_garbage: 0,
+            garbage_queue: 0,
+            garbage_timer: 0.0,
             last_click_pos: None,
             last_click_time: 0.0,
             boosters: vec![
@@ -200,9 +208,41 @@ impl Game {
                 Booster::new(BoosterType::GarbagePush),
                 Booster::new(BoosterType::BarrelBurst),
             ],
+            shake_timer: 0.0,
+            requested_rematch: false,
+            opponent_requested_rematch: false,
+            disconnect_reason: None,
         };
         game.initialize_board();
         game
+    }
+
+    fn reset_game(&mut self) {
+        // Reset game state for rematch
+        self.grid = vec![vec![None; GRID_SIZE]; GRID_SIZE];
+        self.selected = None;
+        self.score = 0;
+        self.opponent_score = 0;
+        self.energy = 0;
+        self.time_remaining = GAME_DURATION;
+        self.animation_timer = 0.0;
+        self.pending_garbage = 0;
+        self.garbage_queue = 0;
+        self.garbage_timer = 0.0;
+        self.last_click_pos = None;
+        self.last_click_time = 0.0;
+        self.shake_timer = 0.0;
+        self.requested_rematch = false;
+        self.opponent_requested_rematch = false;
+        self.disconnect_reason = None;
+
+        // Reset booster cooldowns
+        for booster in &mut self.boosters {
+            booster.cooldown_remaining = 0.0;
+        }
+
+        self.initialize_board();
+        self.state = GameState::Playing;
     }
 
     fn initialize_board(&mut self) {
@@ -294,6 +334,22 @@ impl Game {
                         if booster.cooldown_remaining < 0.0 {
                             booster.cooldown_remaining = 0.0;
                         }
+                    }
+                }
+
+                // Update screen shake
+                if self.shake_timer > 0.0 {
+                    self.shake_timer -= dt;
+                }
+
+                // Update garbage queue timer
+                if self.garbage_queue > 0 {
+                    self.garbage_timer -= dt;
+                    if self.garbage_timer <= 0.0 {
+                        // Time's up - apply the queued garbage
+                        self.pending_garbage = self.garbage_queue;
+                        self.garbage_queue = 0;
+                        self.garbage_timer = 0.0;
                     }
                 }
 
@@ -531,6 +587,7 @@ impl Game {
         // Calculate energy and garbage from matches
         let total_gems = matches.len();
         let mut garbage_to_send = 0;
+        let mut garbage_cancelled = 0;
 
         // Mark gems for removal and create specials
         for match_info in &matches {
@@ -548,11 +605,13 @@ impl Game {
                         let (r, c) = positions[positions.len() / 2];
                         self.grid[r][c] = Some(Gem::new(GemType::Drill));
                         garbage_to_send += 1;
+                        garbage_cancelled += 2; // Cancel 2 incoming garbage
                     } else if positions.len() >= 5 {
                         // Match-5+: Create Mixer
                         let (r, c) = positions[positions.len() / 2];
                         self.grid[r][c] = Some(Gem::new(GemType::Mixer));
                         garbage_to_send += 2;
+                        garbage_cancelled += 4; // Cancel 4 incoming garbage
                     }
                 }
                 MatchType::LShape(positions) | MatchType::TShape(positions) => {
@@ -565,6 +624,7 @@ impl Game {
                     let (r, c) = positions[positions.len() / 2];
                     self.grid[r][c] = Some(Gem::new(GemType::Barrel));
                     garbage_to_send += 2;
+                    garbage_cancelled += 3; // Cancel 3 incoming garbage
                 }
             }
         }
@@ -583,6 +643,23 @@ impl Game {
         // Update score and energy
         self.score += total_gems as u32 * 10;
         self.energy = (self.energy + total_gems as u32).min(100);
+
+        // Apply garbage cancellation
+        if garbage_cancelled > 0 && self.garbage_queue > 0 {
+            let actually_cancelled = garbage_cancelled.min(self.garbage_queue as u32);
+            self.garbage_queue = self.garbage_queue.saturating_sub(actually_cancelled as u8);
+
+            // Visual feedback for cancellation
+            if actually_cancelled > 0 {
+                println!("-{} Incoming Blocked!", actually_cancelled);
+                self.shake_timer = 0.2; // Small shake for feedback
+            }
+
+            // Reset garbage timer if queue is now empty
+            if self.garbage_queue == 0 {
+                self.garbage_timer = 0.0;
+            }
+        }
 
         // Send garbage to opponent
         if garbage_to_send > 0 && self.network_mode == NetworkMode::Online {
@@ -760,6 +837,17 @@ impl Game {
         }
 
         self.score += 50;
+
+        // Cancel garbage from queue
+        if self.garbage_queue > 0 {
+            let cancelled = 1u8.min(self.garbage_queue);
+            self.garbage_queue -= cancelled;
+            println!("-{} Incoming Blocked!", cancelled);
+            if self.garbage_queue == 0 {
+                self.garbage_timer = 0.0;
+            }
+        }
+
         self.apply_gravity();
         self.animation_timer = 0.3;
     }
@@ -778,6 +866,17 @@ impl Game {
         }
 
         self.score += 40;
+
+        // Cancel garbage from queue
+        if self.garbage_queue > 0 {
+            let cancelled = 2u8.min(self.garbage_queue);
+            self.garbage_queue -= cancelled;
+            println!("-{} Incoming Blocked!", cancelled);
+            if self.garbage_queue == 0 {
+                self.garbage_timer = 0.0;
+            }
+        }
+
         self.apply_gravity();
         self.animation_timer = 0.3;
     }
@@ -798,6 +897,17 @@ impl Game {
 
         self.grid[row][col] = None;
         self.score += 100;
+
+        // Cancel garbage from queue
+        if self.garbage_queue > 0 {
+            let cancelled = 3u8.min(self.garbage_queue);
+            self.garbage_queue -= cancelled;
+            println!("-{} Incoming Blocked!", cancelled);
+            if self.garbage_queue == 0 {
+                self.garbage_timer = 0.0;
+            }
+        }
+
         self.apply_gravity();
         self.animation_timer = 0.3;
     }
@@ -809,7 +919,7 @@ impl Game {
 
         // Determine combo type
         match (type1, type2) {
-            (GemType::Drill, GemType::Drill) | (GemType::Drill, GemType::Drill) => {
+            (GemType::Drill, GemType::Drill) => {
                 // Cross Clear: Both row AND column of impact point
                 let center_row = (row1 + row2) / 2;
                 let center_col = (col1 + col2) / 2;
@@ -824,6 +934,7 @@ impl Game {
                 }
 
                 self.score += 150;
+                self.shake_timer = 0.4; // Medium shake
             }
             (GemType::Drill, GemType::Barrel) | (GemType::Barrel, GemType::Drill) => {
                 // Row clear + 3x3 explosion at center
@@ -848,6 +959,7 @@ impl Game {
                 }
 
                 self.score += 120;
+                self.shake_timer = 0.35; // Medium shake
             }
             (GemType::Barrel, GemType::Barrel) => {
                 // Massive 5x5 explosion
@@ -866,6 +978,7 @@ impl Game {
                 }
 
                 self.score += 200;
+                self.shake_timer = 0.5; // Strong shake
             }
             (GemType::Mixer, GemType::Drill) | (GemType::Drill, GemType::Mixer) => {
                 // Convert all gems of one color to Drills
@@ -882,6 +995,7 @@ impl Game {
                 }
 
                 self.score += 250;
+                self.shake_timer = 0.6; // Strong shake
             }
             (GemType::Mixer, GemType::Barrel) | (GemType::Barrel, GemType::Mixer) => {
                 // Convert all gems of one color to Barrels
@@ -898,6 +1012,7 @@ impl Game {
                 }
 
                 self.score += 300;
+                self.shake_timer = 0.7; // Very strong shake
             }
             (GemType::Mixer, GemType::Mixer) => {
                 // MEGA CLEAR: Clear entire board!
@@ -908,12 +1023,46 @@ impl Game {
                 }
 
                 self.score += 500;
+                self.shake_timer = 1.0; // MEGA shake!
             }
             _ => {} // Shouldn't happen
         }
 
         self.apply_gravity();
         self.animation_timer = 0.3;
+    }
+
+    fn receive_garbage(&mut self, amount: u8) {
+        // Add to queue instead of applying immediately
+        self.garbage_queue = self.garbage_queue.saturating_add(amount);
+
+        // Reset timer to 2.5 seconds (warning phase)
+        self.garbage_timer = 2.5;
+
+        // Visual feedback
+        println!("{} Incoming Garbage!", amount);
+        self.shake_timer = 0.3;
+    }
+
+    fn handle_opponent_disconnected(&mut self) {
+        self.disconnect_reason = Some("Opponent Disconnected - You Win!".to_string());
+        self.state = GameState::GameOver;
+        self.time_remaining = 0.0;
+    }
+
+    fn handle_opponent_left(&mut self) {
+        self.disconnect_reason = Some("Opponent Left - You Win!".to_string());
+        self.state = GameState::GameOver;
+        self.time_remaining = 0.0;
+    }
+
+    fn handle_opponent_rematch_request(&mut self) {
+        self.opponent_requested_rematch = true;
+    }
+
+    fn handle_rematch_accepted(&mut self) {
+        // Both players agreed to rematch - reset and start new game
+        self.reset_game();
     }
 
     fn activate_booster(&mut self, booster_index: usize) {
@@ -1184,10 +1333,46 @@ impl Game {
             draw_text("TIED!", screen_width() - 230.0, 70.0, 25.0, YELLOW);
         }
 
+        // Garbage queue warning
+        if self.garbage_queue > 0 {
+            let warning_text = format!("⚠ {} INCOMING GARBAGE!", self.garbage_queue);
+            let warning_x = screen_width() / 2.0 - 150.0;
+            let warning_y = 120.0;
+
+            // Pulsing effect based on timer
+            let pulse = (self.garbage_timer * 3.0).sin().abs();
+            let alpha = (150.0 + pulse * 105.0) as u8;
+
+            draw_rectangle(
+                warning_x - 10.0, warning_y - 30.0,
+                320.0, 40.0,
+                Color::from_rgba(200, 0, 0, alpha)
+            );
+            draw_text(&warning_text, warning_x, warning_y, 30.0, WHITE);
+
+            // Time remaining until drop
+            let time_text = format!("{:.1}s", self.garbage_timer);
+            draw_text(&time_text, warning_x + 250.0, warning_y, 25.0, YELLOW);
+        }
+
+        // Calculate screen shake offset
+        let shake_x = if self.shake_timer > 0.0 {
+            let intensity = 8.0;
+            ((self.shake_timer * 50.0).sin() * intensity) as f32
+        } else {
+            0.0
+        };
+        let shake_y = if self.shake_timer > 0.0 {
+            let intensity = 8.0;
+            ((self.shake_timer * 60.0).cos() * intensity) as f32
+        } else {
+            0.0
+        };
+
         // Grid
         draw_rectangle(
-            BOARD_OFFSET_X - 10.0,
-            BOARD_OFFSET_Y - 10.0,
+            BOARD_OFFSET_X - 10.0 + shake_x,
+            BOARD_OFFSET_Y - 10.0 + shake_y,
             GRID_SIZE as f32 * GEM_SIZE + 20.0,
             GRID_SIZE as f32 * GEM_SIZE + 20.0,
             Color::from_rgba(40, 40, 70, 255),
@@ -1196,8 +1381,8 @@ impl Game {
         // Gems
         for row in 0..GRID_SIZE {
             for col in 0..GRID_SIZE {
-                let x = BOARD_OFFSET_X + col as f32 * GEM_SIZE;
-                let y = BOARD_OFFSET_Y + row as f32 * GEM_SIZE;
+                let x = BOARD_OFFSET_X + col as f32 * GEM_SIZE + shake_x;
+                let y = BOARD_OFFSET_Y + row as f32 * GEM_SIZE + shake_y;
 
                 draw_rectangle(
                     x + 2.0, y + 2.0,
@@ -1291,29 +1476,40 @@ impl Game {
             WHITE,
         );
 
-        let result_text = if self.score > self.opponent_score {
-            "YOU WIN!"
-        } else if self.score < self.opponent_score {
-            "YOU LOSE!"
+        // Check for disconnect
+        if let Some(reason) = &self.disconnect_reason {
+            draw_text(
+                reason,
+                screen_width / 2.0 - 200.0,
+                screen_height / 2.0 - 50.0,
+                40.0,
+                RED,
+            );
         } else {
-            "IT'S A TIE!"
-        };
+            let result_text = if self.score > self.opponent_score {
+                "YOU WIN!"
+            } else if self.score < self.opponent_score {
+                "YOU LOSE!"
+            } else {
+                "IT'S A TIE!"
+            };
 
-        let result_color = if self.score > self.opponent_score {
-            GREEN
-        } else if self.score < self.opponent_score {
-            RED
-        } else {
-            YELLOW
-        };
+            let result_color = if self.score > self.opponent_score {
+                GREEN
+            } else if self.score < self.opponent_score {
+                RED
+            } else {
+                YELLOW
+            };
 
-        draw_text(
-            result_text,
-            screen_width / 2.0 - 100.0,
-            screen_height / 2.0 - 50.0,
-            50.0,
-            result_color,
-        );
+            draw_text(
+                result_text,
+                screen_width / 2.0 - 100.0,
+                screen_height / 2.0 - 50.0,
+                50.0,
+                result_color,
+            );
+        }
 
         draw_text(
             &format!("Your Score: {}", self.score),
@@ -1331,10 +1527,62 @@ impl Game {
             Color::from_rgba(255, 100, 100, 255),
         );
 
+        // Rematch status (for online mode)
+        if self.network_mode == NetworkMode::Online {
+            if self.requested_rematch && self.opponent_requested_rematch {
+                draw_text(
+                    "Starting rematch...",
+                    screen_width / 2.0 - 120.0,
+                    screen_height / 2.0 + 95.0,
+                    25.0,
+                    GREEN,
+                );
+            } else if self.requested_rematch {
+                draw_text(
+                    "Waiting for opponent...",
+                    screen_width / 2.0 - 140.0,
+                    screen_height / 2.0 + 95.0,
+                    25.0,
+                    YELLOW,
+                );
+            } else if self.opponent_requested_rematch {
+                draw_text(
+                    "Opponent wants rematch!",
+                    screen_width / 2.0 - 140.0,
+                    screen_height / 2.0 + 95.0,
+                    25.0,
+                    ORANGE,
+                );
+            }
+        }
+
         let button_x = screen_width / 2.0 - 100.0;
         let button_y = screen_height / 2.0 + 120.0;
-        draw_rectangle(button_x, button_y, 200.0, 50.0, GREEN);
-        draw_text("PLAY AGAIN", button_x + 30.0, button_y + 33.0, 30.0, WHITE);
+
+        let button_color = if self.requested_rematch {
+            Color::from_rgba(100, 100, 100, 255) // Gray if already requested
+        } else {
+            GREEN
+        };
+
+        let button_text = if self.network_mode == NetworkMode::Online {
+            if self.requested_rematch {
+                "REMATCH REQUESTED"
+            } else {
+                "REQUEST REMATCH"
+            }
+        } else {
+            "PLAY AGAIN"
+        };
+
+        draw_rectangle(button_x, button_y, 200.0, 50.0, button_color);
+        draw_text(
+            button_text,
+            button_x + if self.network_mode == NetworkMode::Online && !self.requested_rematch { 15.0 } else { 10.0 },
+            button_y + 33.0,
+            if button_text.len() > 15 { 20.0 } else { 30.0 },
+            WHITE
+        );
     }
 }
 
@@ -1408,7 +1656,17 @@ async fn main() {
 
                     if mouse_x >= button_x && mouse_x <= button_x + 200.0
                         && mouse_y >= button_y && mouse_y <= button_y + 50.0 {
-                        game.state = GameState::Menu;
+                        if game.network_mode == NetworkMode::Online {
+                            // Request rematch in online mode
+                            if !game.requested_rematch {
+                                game.requested_rematch = true;
+                                // TODO: Send ClientMessage::RequestRematch
+                                println!("Would send RequestRematch");
+                            }
+                        } else {
+                            // Go back to menu in offline mode
+                            game.state = GameState::Menu;
+                        }
                     }
                 }
                 _ => {}

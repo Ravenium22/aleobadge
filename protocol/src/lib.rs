@@ -13,6 +13,7 @@ pub enum ClientMessage {
     SendGarbage { amount: u8 },
     ActivateSpecial { row: usize, col: usize },
     ActivateBooster { booster_id: u8 },
+    RequestRematch,
     LeaveGame,
 }
 
@@ -30,6 +31,9 @@ pub enum ServerMessage {
     OpponentActivatedSpecial { row: usize, col: usize },
     OpponentActivatedBooster { booster_id: u8 },
     GameOver { winner: GameResult },
+    OpponentRequestedRematch,
+    RematchAccepted,
+    OpponentLeft,
     OpponentDisconnected,
     Error { message: String },
 }
