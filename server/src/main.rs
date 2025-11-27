@@ -293,6 +293,40 @@ impl ServerState {
                     }
                 }
             }
+            ClientMessage::SendGarbage { amount } => {
+                if let Some(game_id) = self.player_to_game.read().await.get(&player_id) {
+                    if let Some(game) = self.games.read().await.get(game_id) {
+                        // Send garbage to opponent
+                        let opponent_tx = if player_id == game.player1.id {
+                            &game.player2.tx
+                        } else {
+                            &game.player1.tx
+                        };
+
+                        let garbage_msg = ServerMessage::ReceiveGarbage { amount };
+                        let _ = opponent_tx.send(Message::Text(
+                            serde_json::to_string(&garbage_msg).unwrap()
+                        ));
+                    }
+                }
+            }
+            ClientMessage::ActivateSpecial { row, col } => {
+                if let Some(game_id) = self.player_to_game.read().await.get(&player_id) {
+                    if let Some(game) = self.games.read().await.get(game_id) {
+                        // Notify opponent about special activation
+                        let opponent_tx = if player_id == game.player1.id {
+                            &game.player2.tx
+                        } else {
+                            &game.player1.tx
+                        };
+
+                        let special_msg = ServerMessage::OpponentActivatedSpecial { row, col };
+                        let _ = opponent_tx.send(Message::Text(
+                            serde_json::to_string(&special_msg).unwrap()
+                        ));
+                    }
+                }
+            }
             ClientMessage::LeaveGame => {
                 self.remove_player(player_id).await;
             }

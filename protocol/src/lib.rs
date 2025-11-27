@@ -10,6 +10,8 @@ pub enum ClientMessage {
     JoinQueue,
     SwapGems { row1: usize, col1: usize, row2: usize, col2: usize },
     ScoreUpdate { score: u32 },
+    SendGarbage { amount: u8 },
+    ActivateSpecial { row: usize, col: usize },
     LeaveGame,
 }
 
@@ -23,6 +25,8 @@ pub enum ServerMessage {
     OpponentSwap { row1: usize, col1: usize, row2: usize, col2: usize },
     ScoreUpdate { player_score: u32, opponent_score: u32 },
     TimeUpdate { seconds_remaining: u64 },
+    ReceiveGarbage { amount: u8 },
+    OpponentActivatedSpecial { row: usize, col: usize },
     GameOver { winner: GameResult },
     OpponentDisconnected,
     Error { message: String },

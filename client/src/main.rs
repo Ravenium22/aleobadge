@@ -1,24 +1,32 @@
 use macroquad::prelude::*;
 use ::rand::Rng;
+use match3_protocol::{ClientMessage, ServerMessage, GameResult};
 
 const GRID_SIZE: usize = 8;
 const GEM_SIZE: f32 = 60.0;
 const BOARD_OFFSET_X: f32 = 50.0;
-const BOARD_OFFSET_Y: f32 = 120.0;
+const BOARD_OFFSET_Y: f32 = 150.0;
 const GAME_DURATION: f32 = 90.0;
 
+// Extended gem types for Brick City Wars
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum GemType {
+    // Basic colors
     Red,
     Blue,
     Green,
     Yellow,
     Purple,
     Orange,
+    // Special power-ups
+    Drill,       // Match-4: Clears row or column
+    Barrel,      // L/T shape: Explosion radius
+    Mixer,       // Match-5: Color bomb
+    Garbage,     // Unmatchable, blocks play
 }
 
 impl GemType {
-    fn random() -> Self {
+    fn random_basic() -> Self {
         let mut rng = ::rand::thread_rng();
         match rng.gen_range(0..6) {
             0 => GemType::Red,
@@ -30,6 +38,21 @@ impl GemType {
         }
     }
 
+    fn is_basic(&self) -> bool {
+        matches!(self,
+            GemType::Red | GemType::Blue | GemType::Green |
+            GemType::Yellow | GemType::Purple | GemType::Orange
+        )
+    }
+
+    fn is_special(&self) -> bool {
+        matches!(self, GemType::Drill | GemType::Barrel | GemType::Mixer)
+    }
+
+    fn is_garbage(&self) -> bool {
+        matches!(self, GemType::Garbage)
+    }
+
     fn color(&self) -> Color {
         match self {
             GemType::Red => Color::from_rgba(255, 50, 50, 255),
@@ -38,6 +61,10 @@ impl GemType {
             GemType::Yellow => Color::from_rgba(255, 255, 50, 255),
             GemType::Purple => Color::from_rgba(200, 50, 255, 255),
             GemType::Orange => Color::from_rgba(255, 150, 50, 255),
+            GemType::Drill => Color::from_rgba(150, 150, 150, 255),
+            GemType::Barrel => Color::from_rgba(100, 50, 30, 255),
+            GemType::Mixer => Color::from_rgba(255, 255, 255, 255),
+            GemType::Garbage => Color::from_rgba(80, 80, 80, 255),
         }
     }
 }
@@ -47,6 +74,7 @@ struct Gem {
     gem_type: GemType,
     y_offset: f32,
     is_falling: bool,
+    marked_for_removal: bool,
 }
 
 impl Gem {
@@ -55,15 +83,24 @@ impl Gem {
             gem_type,
             y_offset: 0.0,
             is_falling: false,
+            marked_for_removal: false,
         }
     }
 }
 
-#[derive(PartialEq)]
+#[derive(PartialEq, Clone)]
 enum GameState {
     Menu,
+    Connecting,
+    WaitingForMatch,
     Playing,
     GameOver,
+}
+
+#[derive(PartialEq, Clone, Copy)]
+enum NetworkMode {
+    Offline,    // Simulated opponent
+    Online,     // Real multiplayer
 }
 
 struct Game {
@@ -71,9 +108,14 @@ struct Game {
     selected: Option<(usize, usize)>,
     score: u32,
     opponent_score: u32,
+    energy: u32,
     state: GameState,
     time_remaining: f32,
     animation_timer: f32,
+    network_mode: NetworkMode,
+    pending_garbage: u8,
+    last_click_pos: Option<(usize, usize)>,
+    last_click_time: f64,
 }
 
 impl Game {
@@ -83,23 +125,26 @@ impl Game {
             selected: None,
             score: 0,
             opponent_score: 0,
+            energy: 0,
             state: GameState::Menu,
             time_remaining: GAME_DURATION,
             animation_timer: 0.0,
+            network_mode: NetworkMode::Offline,
+            pending_garbage: 0,
+            last_click_pos: None,
+            last_click_time: 0.0,
         };
         game.initialize_board();
         game
     }
 
     fn initialize_board(&mut self) {
-        // Fill board with random gems, avoiding initial matches
         for row in 0..GRID_SIZE {
             for col in 0..GRID_SIZE {
                 loop {
-                    let gem = Gem::new(GemType::random());
+                    let gem = Gem::new(GemType::random_basic());
                     self.grid[row][col] = Some(gem);
 
-                    // Check if this creates a match-3
                     if !self.would_create_initial_match(row, col) {
                         break;
                     }
@@ -148,12 +193,21 @@ impl Game {
         }
     }
 
-    fn start_game(&mut self) {
-        self.state = GameState::Playing;
+    fn start_game(&mut self, online: bool) {
+        self.state = if online {
+            self.network_mode = NetworkMode::Online;
+            GameState::Connecting
+        } else {
+            self.network_mode = NetworkMode::Offline;
+            GameState::Playing
+        };
+
         self.score = 0;
         self.opponent_score = 0;
+        self.energy = 0;
         self.time_remaining = GAME_DURATION;
         self.selected = None;
+        self.pending_garbage = 0;
         self.initialize_board();
     }
 
@@ -170,13 +224,20 @@ impl Game {
                 if self.animation_timer > 0.0 {
                     self.animation_timer -= dt;
                 } else {
-                    // Process falling gems
                     self.update_falling_gems(dt);
+
+                    // Apply pending garbage
+                    if self.pending_garbage > 0 {
+                        self.apply_garbage();
+                        self.pending_garbage = 0;
+                    }
                 }
 
-                // Simulate opponent score increasing
-                if ::rand::random::<f32>() < 0.01 {
-                    self.opponent_score += ::rand::thread_rng().gen_range(10..50);
+                // Simulate opponent in offline mode
+                if self.network_mode == NetworkMode::Offline {
+                    if ::rand::random::<f32>() < 0.01 {
+                        self.opponent_score += ::rand::thread_rng().gen_range(10..50);
+                    }
                 }
             }
             _ => {}
@@ -223,8 +284,25 @@ impl Game {
         let col = col as usize;
         let row = row as usize;
 
+        // Check for double-tap on special gem
+        let current_time = get_time();
+        if let Some((last_row, last_col)) = self.last_click_pos {
+            if last_row == row && last_col == col && (current_time - self.last_click_time) < 0.5 {
+                // Double-tap detected - try to activate special
+                if let Some(gem) = self.grid[row][col] {
+                    if gem.gem_type.is_special() {
+                        self.activate_special(row, col);
+                        self.last_click_pos = None;
+                        return;
+                    }
+                }
+            }
+        }
+
+        self.last_click_pos = Some((row, col));
+        self.last_click_time = current_time;
+
         if let Some((sel_row, sel_col)) = self.selected {
-            // Check if clicked gem is adjacent
             let is_adjacent = (sel_row == row && (sel_col as i32 - col as i32).abs() == 1)
                 || (sel_col == col && (sel_row as i32 - row as i32).abs() == 1);
 
@@ -244,7 +322,6 @@ impl Game {
         self.grid[row1][col1] = self.grid[row2][col2];
         self.grid[row2][col2] = temp;
 
-        // Check if swap creates matches
         let has_match = self.has_match_at(row1, col1) || self.has_match_at(row2, col2);
 
         if has_match {
@@ -263,11 +340,15 @@ impl Game {
             return false;
         }
 
-        let gem_type = self.grid[row][col].unwrap().gem_type;
+        let gem = self.grid[row][col].unwrap();
+        if !gem.gem_type.is_basic() {
+            return false;
+        }
+
+        let gem_type = gem.gem_type;
 
         // Check horizontal
         let mut h_count = 1;
-        // Count left
         let mut c = col as i32 - 1;
         while c >= 0 {
             if let Some(g) = self.grid[row][c as usize] {
@@ -281,7 +362,6 @@ impl Game {
                 break;
             }
         }
-        // Count right
         let mut c = col + 1;
         while c < GRID_SIZE {
             if let Some(g) = self.grid[row][c] {
@@ -302,7 +382,6 @@ impl Game {
 
         // Check vertical
         let mut v_count = 1;
-        // Count up
         let mut r = row as i32 - 1;
         while r >= 0 {
             if let Some(g) = self.grid[r as usize][col] {
@@ -316,7 +395,6 @@ impl Game {
                 break;
             }
         }
-        // Count down
         let mut r = row + 1;
         while r < GRID_SIZE {
             if let Some(g) = self.grid[r][col] {
@@ -335,76 +413,302 @@ impl Game {
     }
 
     fn check_and_remove_matches(&mut self) {
-        let mut to_remove = vec![vec![false; GRID_SIZE]; GRID_SIZE];
-        let mut total_matches = 0;
+        let matches = self.find_all_matches();
 
-        // Find all matches
+        if matches.is_empty() {
+            return;
+        }
+
+        // Calculate energy and garbage from matches
+        let total_gems = matches.len();
+        let mut garbage_to_send = 0;
+
+        // Mark gems for removal and create specials
+        for match_info in &matches {
+            match match_info {
+                MatchType::Line(positions) => {
+                    for &(r, c) in positions {
+                        if let Some(gem) = &mut self.grid[r][c] {
+                            gem.marked_for_removal = true;
+                        }
+                    }
+
+                    // Create special based on match size
+                    if positions.len() == 4 {
+                        // Match-4: Create Drill
+                        let (r, c) = positions[positions.len() / 2];
+                        self.grid[r][c] = Some(Gem::new(GemType::Drill));
+                        garbage_to_send += 1;
+                    } else if positions.len() >= 5 {
+                        // Match-5+: Create Mixer
+                        let (r, c) = positions[positions.len() / 2];
+                        self.grid[r][c] = Some(Gem::new(GemType::Mixer));
+                        garbage_to_send += 2;
+                    }
+                }
+                MatchType::LShape(positions) | MatchType::TShape(positions) => {
+                    for &(r, c) in positions {
+                        if let Some(gem) = &mut self.grid[r][c] {
+                            gem.marked_for_removal = true;
+                        }
+                    }
+                    // L/T Shape: Create Barrel
+                    let (r, c) = positions[positions.len() / 2];
+                    self.grid[r][c] = Some(Gem::new(GemType::Barrel));
+                    garbage_to_send += 2;
+                }
+            }
+        }
+
+        // Remove marked gems
         for row in 0..GRID_SIZE {
             for col in 0..GRID_SIZE {
-                if self.grid[row][col].is_none() {
+                if let Some(gem) = self.grid[row][col] {
+                    if gem.marked_for_removal {
+                        self.grid[row][col] = None;
+                    }
+                }
+            }
+        }
+
+        // Update score and energy
+        self.score += total_gems as u32 * 10;
+        self.energy = (self.energy + total_gems as u32).min(100);
+
+        // Send garbage to opponent
+        if garbage_to_send > 0 && self.network_mode == NetworkMode::Online {
+            // TODO: Send ClientMessage::SendGarbage
+            println!("Would send {} garbage to opponent", garbage_to_send);
+        }
+
+        if total_gems >= 4 {
+            self.score += 20;
+        }
+
+        self.apply_gravity();
+    }
+
+    fn find_all_matches(&self) -> Vec<MatchType> {
+        let mut matches = Vec::new();
+        let mut processed = vec![vec![false; GRID_SIZE]; GRID_SIZE];
+
+        // Find L and T shapes first (they're more specific)
+        for row in 0..GRID_SIZE {
+            for col in 0..GRID_SIZE {
+                if processed[row][col] {
                     continue;
                 }
 
-                let gem_type = self.grid[row][col].unwrap().gem_type;
+                if let Some(gem) = self.grid[row][col] {
+                    if !gem.gem_type.is_basic() {
+                        continue;
+                    }
 
-                // Check horizontal matches
-                let mut h_matches = vec![(row, col)];
-                for c in (col + 1)..GRID_SIZE {
-                    if let Some(g) = self.grid[row][c] {
-                        if g.gem_type == gem_type {
-                            h_matches.push((row, c));
-                        } else {
-                            break;
+                    // Check for L/T shapes
+                    if let Some(shape_match) = self.find_shape_match(row, col) {
+                        for &(r, c) in shape_match.positions() {
+                            processed[r][c] = true;
                         }
-                    } else {
-                        break;
-                    }
-                }
-
-                if h_matches.len() >= 3 {
-                    for &(r, c) in &h_matches {
-                        to_remove[r][c] = true;
-                    }
-                }
-
-                // Check vertical matches
-                let mut v_matches = vec![(row, col)];
-                for r in (row + 1)..GRID_SIZE {
-                    if let Some(g) = self.grid[r][col] {
-                        if g.gem_type == gem_type {
-                            v_matches.push((r, col));
-                        } else {
-                            break;
-                        }
-                    } else {
-                        break;
-                    }
-                }
-
-                if v_matches.len() >= 3 {
-                    for &(r, c) in &v_matches {
-                        to_remove[r][c] = true;
+                        matches.push(shape_match);
                     }
                 }
             }
         }
 
-        // Remove matched gems and count
+        // Find line matches
         for row in 0..GRID_SIZE {
             for col in 0..GRID_SIZE {
-                if to_remove[row][col] {
-                    self.grid[row][col] = None;
-                    total_matches += 1;
+                if processed[row][col] {
+                    continue;
+                }
+
+                if let Some(gem) = self.grid[row][col] {
+                    if !gem.gem_type.is_basic() {
+                        continue;
+                    }
+
+                    let gem_type = gem.gem_type;
+
+                    // Horizontal matches
+                    let mut h_positions = vec![(row, col)];
+                    for c in (col + 1)..GRID_SIZE {
+                        if processed[row][c] {
+                            break;
+                        }
+                        if let Some(g) = self.grid[row][c] {
+                            if g.gem_type == gem_type {
+                                h_positions.push((row, c));
+                            } else {
+                                break;
+                            }
+                        } else {
+                            break;
+                        }
+                    }
+
+                    if h_positions.len() >= 3 {
+                        for &(r, c) in &h_positions {
+                            processed[r][c] = true;
+                        }
+                        matches.push(MatchType::Line(h_positions));
+                        continue;
+                    }
+
+                    // Vertical matches
+                    let mut v_positions = vec![(row, col)];
+                    for r in (row + 1)..GRID_SIZE {
+                        if processed[r][col] {
+                            break;
+                        }
+                        if let Some(g) = self.grid[r][col] {
+                            if g.gem_type == gem_type {
+                                v_positions.push((r, col));
+                            } else {
+                                break;
+                            }
+                        } else {
+                            break;
+                        }
+                    }
+
+                    if v_positions.len() >= 3 {
+                        for &(r, c) in &v_positions {
+                            processed[r][c] = true;
+                        }
+                        matches.push(MatchType::Line(v_positions));
+                    }
                 }
             }
         }
 
-        if total_matches > 0 {
-            self.score += total_matches * 10;
-            if total_matches >= 4 {
-                self.score += 20; // Bonus for 4+ matches
+        matches
+    }
+
+    fn find_shape_match(&self, row: usize, col: usize) -> Option<MatchType> {
+        if let Some(gem) = self.grid[row][col] {
+            if !gem.gem_type.is_basic() {
+                return None;
             }
-            self.apply_gravity();
+
+            let gem_type = gem.gem_type;
+
+            // Check L and T shapes (need at least 5 gems total)
+            // L shape patterns: horizontal line + vertical extension
+            // T shape patterns: vertical line + horizontal extension
+
+            // Try L shapes (4 patterns)
+            // Pattern 1: ─┐ (horizontal right, vertical down)
+            if col + 2 < GRID_SIZE && row + 2 < GRID_SIZE {
+                if self.check_gem_type(row, col + 1, gem_type) &&
+                   self.check_gem_type(row, col + 2, gem_type) &&
+                   self.check_gem_type(row + 1, col + 2, gem_type) &&
+                   self.check_gem_type(row + 2, col + 2, gem_type) {
+                    return Some(MatchType::LShape(vec![
+                        (row, col), (row, col + 1), (row, col + 2),
+                        (row + 1, col + 2), (row + 2, col + 2)
+                    ]));
+                }
+            }
+
+            // More L/T shape patterns can be added here...
+        }
+
+        None
+    }
+
+    fn check_gem_type(&self, row: usize, col: usize, gem_type: GemType) -> bool {
+        if let Some(gem) = self.grid[row][col] {
+            gem.gem_type == gem_type
+        } else {
+            false
+        }
+    }
+
+    fn activate_special(&mut self, row: usize, col: usize) {
+        if let Some(gem) = self.grid[row][col] {
+            match gem.gem_type {
+                GemType::Drill => {
+                    self.activate_drill(row, col);
+                }
+                GemType::Barrel => {
+                    self.activate_barrel(row, col);
+                }
+                GemType::Mixer => {
+                    self.activate_mixer(row, col);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn activate_drill(&mut self, row: usize, col: usize) {
+        // Clear entire row and column
+        for c in 0..GRID_SIZE {
+            self.grid[row][c] = None;
+        }
+        for r in 0..GRID_SIZE {
+            self.grid[r][col] = None;
+        }
+
+        self.score += 50;
+        self.apply_gravity();
+        self.animation_timer = 0.3;
+    }
+
+    fn activate_barrel(&mut self, row: usize, col: usize) {
+        // Clear 3x3 area
+        let min_row = row.saturating_sub(1);
+        let max_row = (row + 2).min(GRID_SIZE);
+        let min_col = col.saturating_sub(1);
+        let max_col = (col + 2).min(GRID_SIZE);
+
+        for r in min_row..max_row {
+            for c in min_col..max_col {
+                self.grid[r][c] = None;
+            }
+        }
+
+        self.score += 40;
+        self.apply_gravity();
+        self.animation_timer = 0.3;
+    }
+
+    fn activate_mixer(&mut self, row: usize, col: usize) {
+        // Remove all gems of a random color
+        let target_color = GemType::random_basic();
+
+        for r in 0..GRID_SIZE {
+            for c in 0..GRID_SIZE {
+                if let Some(gem) = self.grid[r][c] {
+                    if gem.gem_type == target_color {
+                        self.grid[r][c] = None;
+                    }
+                }
+            }
+        }
+
+        self.grid[row][col] = None;
+        self.score += 100;
+        self.apply_gravity();
+        self.animation_timer = 0.3;
+    }
+
+    fn apply_garbage(&mut self) {
+        let amount = self.pending_garbage as usize;
+
+        // Shift existing rows up
+        for _ in 0..amount {
+            // Move all rows up
+            for row in 0..GRID_SIZE - 1 {
+                for col in 0..GRID_SIZE {
+                    self.grid[row][col] = self.grid[row + 1][col];
+                }
+            }
+
+            // Fill bottom row with garbage
+            for col in 0..GRID_SIZE {
+                self.grid[GRID_SIZE - 1][col] = Some(Gem::new(GemType::Garbage));
+            }
         }
     }
 
@@ -412,7 +716,6 @@ impl Game {
         for col in 0..GRID_SIZE {
             let mut write_row = GRID_SIZE;
 
-            // Move existing gems down
             for row in (0..GRID_SIZE).rev() {
                 if self.grid[row][col].is_some() {
                     write_row -= 1;
@@ -423,9 +726,8 @@ impl Game {
                 }
             }
 
-            // Fill empty spaces at top with new gems
             for row in 0..write_row {
-                let mut new_gem = Gem::new(GemType::random());
+                let mut new_gem = Gem::new(GemType::random_basic());
                 new_gem.y_offset = (write_row - row) as f32 * GEM_SIZE;
                 new_gem.is_falling = true;
                 self.grid[row][col] = Some(new_gem);
@@ -439,15 +741,11 @@ impl Game {
         clear_background(Color::from_rgba(20, 20, 40, 255));
 
         match self.state {
-            GameState::Menu => {
-                self.draw_menu();
-            }
-            GameState::Playing => {
-                self.draw_game();
-            }
-            GameState::GameOver => {
-                self.draw_game_over();
-            }
+            GameState::Menu => self.draw_menu(),
+            GameState::Connecting => self.draw_connecting(),
+            GameState::WaitingForMatch => self.draw_waiting(),
+            GameState::Playing => self.draw_game(),
+            GameState::GameOver => self.draw_game_over(),
         }
     }
 
@@ -456,82 +754,114 @@ impl Game {
         let screen_height = screen_height();
 
         draw_text(
-            "MATCH 3 PVP",
-            screen_width / 2.0 - 150.0,
-            screen_height / 2.0 - 100.0,
+            "BRICK CITY WARS",
+            screen_width / 2.0 - 180.0,
+            screen_height / 2.0 - 150.0,
             60.0,
             WHITE,
         );
 
         draw_text(
-            "Real-time Match-3 Battle",
-            screen_width / 2.0 - 120.0,
-            screen_height / 2.0 - 40.0,
+            "Match-3 PvP Battle",
+            screen_width / 2.0 - 100.0,
+            screen_height / 2.0 - 90.0,
             25.0,
             LIGHTGRAY,
         );
 
+        // Offline button
+        let offline_x = screen_width / 2.0 - 100.0;
+        let offline_y = screen_height / 2.0 - 20.0;
+        draw_rectangle(offline_x, offline_y, 200.0, 50.0, GREEN);
+        draw_text("OFFLINE MODE", offline_x + 20.0, offline_y + 33.0, 25.0, WHITE);
+
+        // Online button
+        let online_x = screen_width / 2.0 - 100.0;
+        let online_y = screen_height / 2.0 + 50.0;
+        draw_rectangle(online_x, online_y, 200.0, 50.0, BLUE);
+        draw_text("ONLINE MODE", online_x + 25.0, online_y + 33.0, 25.0, WHITE);
+
+        // Instructions
         draw_text(
-            "Match 3 or more gems to score points!",
-            screen_width / 2.0 - 180.0,
+            "Match 3+ gems | Double-tap specials",
+            screen_width / 2.0 - 150.0,
+            screen_height / 2.0 + 130.0,
+            18.0,
+            LIGHTGRAY,
+        );
+    }
+
+    fn draw_connecting(&self) {
+        let screen_width = screen_width();
+        let screen_height = screen_height();
+
+        draw_text(
+            "Connecting to server...",
+            screen_width / 2.0 - 150.0,
             screen_height / 2.0,
-            20.0,
-            LIGHTGRAY,
+            30.0,
+            WHITE,
         );
+    }
+
+    fn draw_waiting(&self) {
+        let screen_width = screen_width();
+        let screen_height = screen_height();
 
         draw_text(
-            "You have 90 seconds to beat your opponent!",
-            screen_width / 2.0 - 200.0,
-            screen_height / 2.0 + 30.0,
-            20.0,
-            LIGHTGRAY,
+            "Waiting for opponent...",
+            screen_width / 2.0 - 150.0,
+            screen_height / 2.0,
+            30.0,
+            WHITE,
         );
-
-        // Draw start button
-        let button_x = screen_width / 2.0 - 100.0;
-        let button_y = screen_height / 2.0 + 80.0;
-        draw_rectangle(button_x, button_y, 200.0, 50.0, GREEN);
-        draw_text("START GAME", button_x + 30.0, button_y + 33.0, 30.0, WHITE);
     }
 
     fn draw_game(&self) {
-        // Draw header background
-        draw_rectangle(0.0, 0.0, screen_width(), 100.0, Color::from_rgba(30, 30, 60, 255));
+        // Header background
+        draw_rectangle(0.0, 0.0, screen_width(), 130.0, Color::from_rgba(30, 30, 60, 255));
 
-        // Draw timer
+        // Timer
         let minutes = (self.time_remaining / 60.0) as u32;
         let seconds = (self.time_remaining % 60.0) as u32;
         let timer_text = format!("Time: {:02}:{:02}", minutes, seconds);
         let timer_color = if self.time_remaining < 20.0 { RED } else { WHITE };
-        draw_text(&timer_text, 20.0, 40.0, 40.0, timer_color);
+        draw_text(&timer_text, 20.0, 35.0, 35.0, timer_color);
 
-        // Draw scores
+        // Scores
         draw_text(
-            &format!("Your Score: {}", self.score),
-            20.0,
-            80.0,
-            30.0,
-            YELLOW,
+            &format!("You: {}", self.score),
+            20.0, 70.0, 28.0, YELLOW,
         );
 
         draw_text(
             &format!("Opponent: {}", self.opponent_score),
-            screen_width() - 250.0,
-            40.0,
-            30.0,
+            screen_width() - 230.0, 35.0, 28.0,
             Color::from_rgba(255, 100, 100, 255),
         );
 
-        // Draw winning/losing indicator
+        // Energy bar
+        let energy_x = 20.0;
+        let energy_y = 95.0;
+        let energy_width = 200.0;
+        let energy_height = 20.0;
+
+        draw_rectangle(energy_x, energy_y, energy_width, energy_height, Color::from_rgba(50, 50, 50, 255));
+        let filled_width = (self.energy as f32 / 100.0) * energy_width;
+        draw_rectangle(energy_x, energy_y, filled_width, energy_height, Color::from_rgba(255, 200, 0, 255));
+        draw_rectangle_lines(energy_x, energy_y, energy_width, energy_height, 2.0, WHITE);
+        draw_text(&format!("Energy: {}/100", self.energy), energy_x, energy_y - 5.0, 18.0, WHITE);
+
+        // Status indicator
         if self.score > self.opponent_score {
-            draw_text("WINNING!", screen_width() - 250.0, 75.0, 25.0, GREEN);
+            draw_text("WINNING!", screen_width() - 230.0, 70.0, 25.0, GREEN);
         } else if self.score < self.opponent_score {
-            draw_text("LOSING!", screen_width() - 250.0, 75.0, 25.0, RED);
+            draw_text("LOSING!", screen_width() - 230.0, 70.0, 25.0, RED);
         } else {
-            draw_text("TIED!", screen_width() - 250.0, 75.0, 25.0, YELLOW);
+            draw_text("TIED!", screen_width() - 230.0, 70.0, 25.0, YELLOW);
         }
 
-        // Draw grid background
+        // Grid
         draw_rectangle(
             BOARD_OFFSET_X - 10.0,
             BOARD_OFFSET_Y - 10.0,
@@ -540,52 +870,79 @@ impl Game {
             Color::from_rgba(40, 40, 70, 255),
         );
 
-        // Draw gems
+        // Gems
         for row in 0..GRID_SIZE {
             for col in 0..GRID_SIZE {
                 let x = BOARD_OFFSET_X + col as f32 * GEM_SIZE;
                 let y = BOARD_OFFSET_Y + row as f32 * GEM_SIZE;
 
-                // Draw cell background
                 draw_rectangle(
-                    x + 2.0,
-                    y + 2.0,
-                    GEM_SIZE - 4.0,
-                    GEM_SIZE - 4.0,
+                    x + 2.0, y + 2.0,
+                    GEM_SIZE - 4.0, GEM_SIZE - 4.0,
                     Color::from_rgba(30, 30, 50, 255),
                 );
 
                 if let Some(gem) = self.grid[row][col] {
                     let gem_y = y + gem.y_offset;
 
-                    // Draw gem
-                    draw_circle(
-                        x + GEM_SIZE / 2.0,
-                        gem_y + GEM_SIZE / 2.0,
-                        GEM_SIZE / 2.5,
-                        gem.gem_type.color(),
-                    );
-
-                    // Draw gem highlight
-                    draw_circle(
-                        x + GEM_SIZE / 2.0 - 8.0,
-                        gem_y + GEM_SIZE / 2.0 - 8.0,
-                        GEM_SIZE / 8.0,
-                        Color::from_rgba(255, 255, 255, 150),
-                    );
+                    // Draw gem based on type
+                    match gem.gem_type {
+                        GemType::Red | GemType::Blue | GemType::Green |
+                        GemType::Yellow | GemType::Purple | GemType::Orange => {
+                            draw_circle(
+                                x + GEM_SIZE / 2.0,
+                                gem_y + GEM_SIZE / 2.0,
+                                GEM_SIZE / 2.5,
+                                gem.gem_type.color(),
+                            );
+                            draw_circle(
+                                x + GEM_SIZE / 2.0 - 8.0,
+                                gem_y + GEM_SIZE / 2.0 - 8.0,
+                                GEM_SIZE / 8.0,
+                                Color::from_rgba(255, 255, 255, 150),
+                            );
+                        }
+                        GemType::Drill => {
+                            draw_rectangle(
+                                x + 10.0, gem_y + 10.0,
+                                GEM_SIZE - 20.0, GEM_SIZE - 20.0,
+                                gem.gem_type.color(),
+                            );
+                            draw_text("D", x + 18.0, gem_y + 40.0, 30.0, WHITE);
+                        }
+                        GemType::Barrel => {
+                            draw_circle(
+                                x + GEM_SIZE / 2.0,
+                                gem_y + GEM_SIZE / 2.0,
+                                GEM_SIZE / 2.5,
+                                gem.gem_type.color(),
+                            );
+                            draw_text("B", x + 18.0, gem_y + 40.0, 30.0, WHITE);
+                        }
+                        GemType::Mixer => {
+                            for i in 0..6 {
+                                let angle = (i as f32 / 6.0) * std::f32::consts::PI * 2.0;
+                                let r = GEM_SIZE / 3.0;
+                                let px = x + GEM_SIZE / 2.0 + angle.cos() * r;
+                                let py = gem_y + GEM_SIZE / 2.0 + angle.sin() * r;
+                                draw_circle(px, py, 8.0, gem.gem_type.color());
+                            }
+                        }
+                        GemType::Garbage => {
+                            draw_rectangle(
+                                x + 5.0, gem_y + 5.0,
+                                GEM_SIZE - 10.0, GEM_SIZE - 10.0,
+                                gem.gem_type.color(),
+                            );
+                            draw_text("X", x + 18.0, gem_y + 40.0, 30.0, RED);
+                        }
+                    }
                 }
 
-                // Highlight selected gem
+                // Selection highlight
                 if let Some((sel_row, sel_col)) = self.selected {
                     if sel_row == row && sel_col == col {
-                        draw_rectangle_lines(
-                            x,
-                            y,
-                            GEM_SIZE,
-                            GEM_SIZE,
-                            4.0,
-                            YELLOW,
-                        );
+                        draw_rectangle_lines(x, y, GEM_SIZE, GEM_SIZE, 4.0, YELLOW);
                     }
                 }
             }
@@ -593,22 +950,16 @@ impl Game {
     }
 
     fn draw_game_over(&self) {
-        // Draw the final board state
         self.draw_game();
 
-        // Draw semi-transparent overlay
         draw_rectangle(
-            0.0,
-            0.0,
-            screen_width(),
-            screen_height(),
+            0.0, 0.0, screen_width(), screen_height(),
             Color::from_rgba(0, 0, 0, 200),
         );
 
         let screen_width = screen_width();
         let screen_height = screen_height();
 
-        // Draw game over text
         draw_text(
             "GAME OVER",
             screen_width / 2.0 - 150.0,
@@ -617,7 +968,6 @@ impl Game {
             WHITE,
         );
 
-        // Draw result
         let result_text = if self.score > self.opponent_score {
             "YOU WIN!"
         } else if self.score < self.opponent_score {
@@ -642,7 +992,6 @@ impl Game {
             result_color,
         );
 
-        // Draw final scores
         draw_text(
             &format!("Your Score: {}", self.score),
             screen_width / 2.0 - 120.0,
@@ -652,14 +1001,13 @@ impl Game {
         );
 
         draw_text(
-            &format!("Opponent Score: {}", self.opponent_score),
-            screen_width / 2.0 - 150.0,
+            &format!("Opponent: {}", self.opponent_score),
+            screen_width / 2.0 - 120.0,
             screen_height / 2.0 + 60.0,
             35.0,
             Color::from_rgba(255, 100, 100, 255),
         );
 
-        // Draw play again button
         let button_x = screen_width / 2.0 - 100.0;
         let button_y = screen_height / 2.0 + 120.0;
         draw_rectangle(button_x, button_y, 200.0, 50.0, GREEN);
@@ -667,11 +1015,26 @@ impl Game {
     }
 }
 
+#[derive(Clone)]
+enum MatchType {
+    Line(Vec<(usize, usize)>),
+    LShape(Vec<(usize, usize)>),
+    TShape(Vec<(usize, usize)>),
+}
+
+impl MatchType {
+    fn positions(&self) -> &Vec<(usize, usize)> {
+        match self {
+            MatchType::Line(p) | MatchType::LShape(p) | MatchType::TShape(p) => p,
+        }
+    }
+}
+
 fn window_conf() -> Conf {
     Conf {
-        window_title: "Match 3 PVP".to_owned(),
+        window_title: "Brick City Wars - Match3 PVP".to_owned(),
         window_width: 600,
-        window_height: 800,
+        window_height: 850,
         ..Default::default()
     }
 }
@@ -684,7 +1047,6 @@ async fn main() {
         let dt = get_frame_time();
         game.update(dt);
 
-        // Handle input
         if is_mouse_button_pressed(MouseButton::Left) {
             let (mouse_x, mouse_y) = mouse_position();
 
@@ -692,15 +1054,24 @@ async fn main() {
                 GameState::Menu => {
                     let screen_width = screen_width();
                     let screen_height = screen_height();
-                    let button_x = screen_width / 2.0 - 100.0;
-                    let button_y = screen_height / 2.0 + 80.0;
 
-                    if mouse_x >= button_x
-                        && mouse_x <= button_x + 200.0
-                        && mouse_y >= button_y
-                        && mouse_y <= button_y + 50.0
-                    {
-                        game.start_game();
+                    // Offline button
+                    let offline_x = screen_width / 2.0 - 100.0;
+                    let offline_y = screen_height / 2.0 - 20.0;
+                    if mouse_x >= offline_x && mouse_x <= offline_x + 200.0
+                        && mouse_y >= offline_y && mouse_y <= offline_y + 50.0 {
+                        game.start_game(false);
+                    }
+
+                    // Online button
+                    let online_x = screen_width / 2.0 - 100.0;
+                    let online_y = screen_height / 2.0 + 50.0;
+                    if mouse_x >= online_x && mouse_x <= online_x + 200.0
+                        && mouse_y >= online_y && mouse_y <= online_y + 50.0 {
+                        game.start_game(true);
+                        // TODO: Initialize WebSocket connection
+                        println!("Online mode not fully implemented - starting offline");
+                        game.start_game(false);
                     }
                 }
                 GameState::Playing => {
@@ -712,14 +1083,12 @@ async fn main() {
                     let button_x = screen_width / 2.0 - 100.0;
                     let button_y = screen_height / 2.0 + 120.0;
 
-                    if mouse_x >= button_x
-                        && mouse_x <= button_x + 200.0
-                        && mouse_y >= button_y
-                        && mouse_y <= button_y + 50.0
-                    {
-                        game.start_game();
+                    if mouse_x >= button_x && mouse_x <= button_x + 200.0
+                        && mouse_y >= button_y && mouse_y <= button_y + 50.0 {
+                        game.state = GameState::Menu;
                     }
                 }
+                _ => {}
             }
         }
 
