@@ -1,6 +1,14 @@
 # Match3 PVP - Real-time Match-3 Battle Game
 
-A real-time PvP match-3 game built with Rust and Macrosquad where players compete to get the most points in 90 seconds.
+A complete real-time multiplayer PvP match-3 game built with Rust. Features a game client (Macrosquad) and dedicated multiplayer server (Tokio + WebSockets).
+
+## Project Structure
+
+This is a Cargo workspace containing:
+
+- **`client/`** - Game client with Macrosquad (desktop and mobile)
+- **`server/`** - Multiplayer server with matchmaking and game synchronization
+- **`protocol/`** - Shared protocol definitions for client-server communication
 
 ## Features
 
@@ -29,15 +37,37 @@ A real-time PvP match-3 game built with Rust and Macrosquad where players compet
 - Rust (latest stable version)
 - Cargo
 
-### Build
+### Build Everything
 ```bash
 cargo build --release
 ```
 
-### Run
+### Running the Multiplayer Game
+
+#### 1. Start the Server
 ```bash
-cargo run --release
+cargo run --release -p match3-server
 ```
+
+The server will start on `127.0.0.1:9001`.
+
+#### 2. Start Client(s)
+```bash
+# Terminal 1: Player 1
+cargo run --release -p match3-pvp
+
+# Terminal 2: Player 2
+cargo run --release -p match3-pvp
+```
+
+Both clients will connect to the server, get matched, and play against each other!
+
+### Running Standalone (Offline Mode)
+```bash
+cargo run --release -p match3-pvp
+```
+
+The client can also run standalone with simulated opponent for testing.
 
 ## Controls
 
@@ -47,11 +77,24 @@ cargo run --release
 
 ## Technical Details
 
+### Client
 - **Language**: Rust
 - **Framework**: Macrosquad 0.4
 - **Grid Size**: 8x8
 - **Gem Types**: 6 different colored gems
 - **Platform**: Cross-platform (Desktop and Mobile)
+
+### Server
+- **Language**: Rust
+- **Async Runtime**: Tokio
+- **WebSocket**: tokio-tungstenite
+- **Matchmaking**: FIFO queue system
+- **Concurrency**: Supports multiple simultaneous games
+
+### Protocol
+- **Transport**: WebSocket (JSON messages)
+- **Synchronization**: Real-time score and move updates
+- **Timer**: Server-authoritative 90-second countdown
 
 ## Mobile Deployment
 
