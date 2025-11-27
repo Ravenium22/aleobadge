@@ -16,12 +16,13 @@ pub enum ClientMessage {
     ActivateBooster { booster_id: u8 },
     RequestRematch,
     LeaveGame,
+    FetchLeaderboard,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum ServerMessage {
-    AuthAccepted { player_id: PlayerId, username: String, elo: i32, wins: u32, losses: u32 },
+    AuthAccepted { player_id: PlayerId, username: String, elo: i32, wins: u32, losses: u32, bricks: u32, gold: u32 },
     AuthRejected { reason: String },
     Connected { player_id: PlayerId },
     Queued { position: usize },
@@ -34,11 +35,12 @@ pub enum ServerMessage {
     OpponentActivatedSpecial { row: usize, col: usize },
     OpponentActivatedBooster { booster_id: u8 },
     GameOver { winner: GameResult },
-    MatchResult { new_elo: i32, elo_change: i32, wins: u32, losses: u32 },
+    MatchResult { new_elo: i32, elo_change: i32, wins: u32, losses: u32, bricks: u32, gold: u32 },
     OpponentRequestedRematch,
     RematchAccepted,
     OpponentLeft,
     OpponentDisconnected,
+    LeaderboardData { players: Vec<(String, i32)> },
     Error { message: String },
 }
 
