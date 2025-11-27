@@ -12,6 +12,7 @@ pub enum ClientMessage {
     ScoreUpdate { score: u32 },
     SendGarbage { amount: u8 },
     ActivateSpecial { row: usize, col: usize },
+    ActivateBooster { booster_id: u8 },
     LeaveGame,
 }
 
@@ -27,6 +28,7 @@ pub enum ServerMessage {
     TimeUpdate { seconds_remaining: u64 },
     ReceiveGarbage { amount: u8 },
     OpponentActivatedSpecial { row: usize, col: usize },
+    OpponentActivatedBooster { booster_id: u8 },
     GameOver { winner: GameResult },
     OpponentDisconnected,
     Error { message: String },

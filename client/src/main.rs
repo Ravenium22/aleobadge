@@ -69,6 +69,67 @@ impl GemType {
     }
 }
 
+// Booster types for active skills
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum BoosterType {
+    MicroRefill,    // ID 0: +10 energy, cost 0
+    GarbagePush,    // ID 1: Convert bottom garbage row, cost 30
+    BarrelBurst,    // ID 2: Spawn random barrel, cost 50
+}
+
+impl BoosterType {
+    fn id(&self) -> u8 {
+        match self {
+            BoosterType::MicroRefill => 0,
+            BoosterType::GarbagePush => 1,
+            BoosterType::BarrelBurst => 2,
+        }
+    }
+
+    fn cost(&self) -> u32 {
+        match self {
+            BoosterType::MicroRefill => 0,  // Free for testing
+            BoosterType::GarbagePush => 30,
+            BoosterType::BarrelBurst => 50,
+        }
+    }
+
+    fn name(&self) -> &str {
+        match self {
+            BoosterType::MicroRefill => "Refill",
+            BoosterType::GarbagePush => "Push",
+            BoosterType::BarrelBurst => "Barrel",
+        }
+    }
+
+    fn color(&self) -> Color {
+        match self {
+            BoosterType::MicroRefill => Color::from_rgba(100, 255, 100, 255),
+            BoosterType::GarbagePush => Color::from_rgba(255, 200, 100, 255),
+            BoosterType::BarrelBurst => Color::from_rgba(200, 100, 255, 255),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct Booster {
+    booster_type: BoosterType,
+    cooldown_remaining: f32,
+}
+
+impl Booster {
+    fn new(booster_type: BoosterType) -> Self {
+        Self {
+            booster_type,
+            cooldown_remaining: 0.0,
+        }
+    }
+
+    fn can_activate(&self, energy: u32) -> bool {
+        self.cooldown_remaining <= 0.0 && energy >= self.booster_type.cost()
+    }
+}
+
 #[derive(Clone, Copy)]
 struct Gem {
     gem_type: GemType,
@@ -116,6 +177,7 @@ struct Game {
     pending_garbage: u8,
     last_click_pos: Option<(usize, usize)>,
     last_click_time: f64,
+    boosters: Vec<Booster>,
 }
 
 impl Game {
@@ -133,6 +195,11 @@ impl Game {
             pending_garbage: 0,
             last_click_pos: None,
             last_click_time: 0.0,
+            boosters: vec![
+                Booster::new(BoosterType::MicroRefill),
+                Booster::new(BoosterType::GarbagePush),
+                Booster::new(BoosterType::BarrelBurst),
+            ],
         };
         game.initialize_board();
         game
@@ -218,6 +285,36 @@ impl Game {
                 if self.time_remaining <= 0.0 {
                     self.time_remaining = 0.0;
                     self.state = GameState::GameOver;
+                }
+
+                // Update booster cooldowns
+                for booster in &mut self.boosters {
+                    if booster.cooldown_remaining > 0.0 {
+                        booster.cooldown_remaining -= dt;
+                        if booster.cooldown_remaining < 0.0 {
+                            booster.cooldown_remaining = 0.0;
+                        }
+                    }
+                }
+
+                // Check for overflow (gems in row 0 or negative = instant loss)
+                let mut has_overflow = false;
+                for col in 0..GRID_SIZE {
+                    if let Some(gem) = self.grid[0][col] {
+                        if !gem.is_falling && gem.y_offset <= 0.0 {
+                            // Check if it's a settled garbage or regular gem
+                            if gem.gem_type.is_garbage() || gem.gem_type.is_basic() {
+                                has_overflow = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                if has_overflow {
+                    // Overflow = instant loss
+                    self.state = GameState::GameOver;
+                    self.time_remaining = 0.0;
                 }
 
                 // Update animations
@@ -318,6 +415,18 @@ impl Game {
     }
 
     fn swap_gems(&mut self, row1: usize, col1: usize, row2: usize, col2: usize) {
+        // Check for special gem combos BEFORE swapping
+        let gem1 = self.grid[row1][col1];
+        let gem2 = self.grid[row2][col2];
+
+        if let (Some(g1), Some(g2)) = (gem1, gem2) {
+            if g1.gem_type.is_special() && g2.gem_type.is_special() {
+                // Special + Special = COMBO!
+                self.activate_combo(row1, col1, row2, col2, g1.gem_type, g2.gem_type);
+                return;
+            }
+        }
+
         let temp = self.grid[row1][col1];
         self.grid[row1][col1] = self.grid[row2][col2];
         self.grid[row2][col2] = temp;
@@ -693,6 +802,166 @@ impl Game {
         self.animation_timer = 0.3;
     }
 
+    fn activate_combo(&mut self, row1: usize, col1: usize, row2: usize, col2: usize, type1: GemType, type2: GemType) {
+        // Remove both gems first
+        self.grid[row1][col1] = None;
+        self.grid[row2][col2] = None;
+
+        // Determine combo type
+        match (type1, type2) {
+            (GemType::Drill, GemType::Drill) | (GemType::Drill, GemType::Drill) => {
+                // Cross Clear: Both row AND column of impact point
+                let center_row = (row1 + row2) / 2;
+                let center_col = (col1 + col2) / 2;
+
+                // Clear entire row
+                for c in 0..GRID_SIZE {
+                    self.grid[center_row][c] = None;
+                }
+                // Clear entire column
+                for r in 0..GRID_SIZE {
+                    self.grid[r][center_col] = None;
+                }
+
+                self.score += 150;
+            }
+            (GemType::Drill, GemType::Barrel) | (GemType::Barrel, GemType::Drill) => {
+                // Row clear + 3x3 explosion at center
+                let center_row = (row1 + row2) / 2;
+                let center_col = (col1 + col2) / 2;
+
+                // Clear row
+                for c in 0..GRID_SIZE {
+                    self.grid[center_row][c] = None;
+                }
+
+                // 3x3 explosion
+                let min_row = center_row.saturating_sub(1);
+                let max_row = (center_row + 2).min(GRID_SIZE);
+                let min_col = center_col.saturating_sub(1);
+                let max_col = (center_col + 2).min(GRID_SIZE);
+
+                for r in min_row..max_row {
+                    for c in min_col..max_col {
+                        self.grid[r][c] = None;
+                    }
+                }
+
+                self.score += 120;
+            }
+            (GemType::Barrel, GemType::Barrel) => {
+                // Massive 5x5 explosion
+                let center_row = (row1 + row2) / 2;
+                let center_col = (col1 + col2) / 2;
+
+                let min_row = center_row.saturating_sub(2);
+                let max_row = (center_row + 3).min(GRID_SIZE);
+                let min_col = center_col.saturating_sub(2);
+                let max_col = (center_col + 3).min(GRID_SIZE);
+
+                for r in min_row..max_row {
+                    for c in min_col..max_col {
+                        self.grid[r][c] = None;
+                    }
+                }
+
+                self.score += 200;
+            }
+            (GemType::Mixer, GemType::Drill) | (GemType::Drill, GemType::Mixer) => {
+                // Convert all gems of one color to Drills
+                let target_color = GemType::random_basic();
+
+                for r in 0..GRID_SIZE {
+                    for c in 0..GRID_SIZE {
+                        if let Some(gem) = self.grid[r][c] {
+                            if gem.gem_type == target_color {
+                                self.grid[r][c] = Some(Gem::new(GemType::Drill));
+                            }
+                        }
+                    }
+                }
+
+                self.score += 250;
+            }
+            (GemType::Mixer, GemType::Barrel) | (GemType::Barrel, GemType::Mixer) => {
+                // Convert all gems of one color to Barrels
+                let target_color = GemType::random_basic();
+
+                for r in 0..GRID_SIZE {
+                    for c in 0..GRID_SIZE {
+                        if let Some(gem) = self.grid[r][c] {
+                            if gem.gem_type == target_color {
+                                self.grid[r][c] = Some(Gem::new(GemType::Barrel));
+                            }
+                        }
+                    }
+                }
+
+                self.score += 300;
+            }
+            (GemType::Mixer, GemType::Mixer) => {
+                // MEGA CLEAR: Clear entire board!
+                for r in 0..GRID_SIZE {
+                    for c in 0..GRID_SIZE {
+                        self.grid[r][c] = None;
+                    }
+                }
+
+                self.score += 500;
+            }
+            _ => {} // Shouldn't happen
+        }
+
+        self.apply_gravity();
+        self.animation_timer = 0.3;
+    }
+
+    fn activate_booster(&mut self, booster_index: usize) {
+        if booster_index >= self.boosters.len() {
+            return;
+        }
+
+        let booster = self.boosters[booster_index];
+        if !booster.can_activate(self.energy) {
+            return;
+        }
+
+        // Deduct energy cost
+        self.energy = self.energy.saturating_sub(booster.booster_type.cost());
+
+        // Activate booster effect
+        match booster.booster_type {
+            BoosterType::MicroRefill => {
+                self.energy = (self.energy + 10).min(100);
+            }
+            BoosterType::GarbagePush => {
+                // Convert bottom garbage row to random gems
+                for col in 0..GRID_SIZE {
+                    if let Some(gem) = self.grid[GRID_SIZE - 1][col] {
+                        if gem.gem_type.is_garbage() {
+                            self.grid[GRID_SIZE - 1][col] = Some(Gem::new(GemType::random_basic()));
+                        }
+                    }
+                }
+            }
+            BoosterType::BarrelBurst => {
+                // Spawn a random Barrel on the board
+                let mut rng = ::rand::thread_rng();
+                let row = rng.gen_range(0..GRID_SIZE);
+                let col = rng.gen_range(0..GRID_SIZE);
+                self.grid[row][col] = Some(Gem::new(GemType::Barrel));
+            }
+        }
+
+        // Set cooldown
+        self.boosters[booster_index].cooldown_remaining = 5.0;
+
+        // TODO: Send network message if online
+        if self.network_mode == NetworkMode::Online {
+            println!("Would send ActivateBooster {{ booster_id: {} }}", booster.booster_type.id());
+        }
+    }
+
     fn apply_garbage(&mut self) {
         let amount = self.pending_garbage as usize;
 
@@ -851,6 +1120,60 @@ impl Game {
         draw_rectangle(energy_x, energy_y, filled_width, energy_height, Color::from_rgba(255, 200, 0, 255));
         draw_rectangle_lines(energy_x, energy_y, energy_width, energy_height, 2.0, WHITE);
         draw_text(&format!("Energy: {}/100", self.energy), energy_x, energy_y - 5.0, 18.0, WHITE);
+
+        // Booster HUD (right side)
+        let booster_start_x = screen_width() - 250.0;
+        let booster_y = 95.0;
+        let booster_size = 50.0;
+        let booster_spacing = 60.0;
+
+        for (i, booster) in self.boosters.iter().enumerate() {
+            let x = booster_start_x + i as f32 * booster_spacing;
+            let can_use = booster.can_activate(self.energy);
+
+            // Draw booster box
+            let box_color = if can_use {
+                booster.booster_type.color()
+            } else {
+                Color::from_rgba(60, 60, 60, 255)
+            };
+
+            draw_rectangle(x, booster_y, booster_size, booster_size, box_color);
+            draw_rectangle_lines(x, booster_y, booster_size, booster_size, 2.0, WHITE);
+
+            // Draw booster name
+            draw_text(
+                booster.booster_type.name(),
+                x + 5.0,
+                booster_y + 25.0,
+                20.0,
+                WHITE
+            );
+
+            // Draw cost
+            draw_text(
+                &format!("{}", booster.booster_type.cost()),
+                x + 15.0,
+                booster_y + 45.0,
+                16.0,
+                YELLOW
+            );
+
+            // Draw key hint
+            draw_text(
+                &format!("[{}]", i + 1),
+                x + 5.0,
+                booster_y - 3.0,
+                14.0,
+                LIGHTGRAY
+            );
+
+            // Draw cooldown if active
+            if booster.cooldown_remaining > 0.0 {
+                let cd_text = format!("{:.1}s", booster.cooldown_remaining);
+                draw_text(&cd_text, x + 10.0, booster_y + 35.0, 18.0, RED);
+            }
+        }
 
         // Status indicator
         if self.score > self.opponent_score {
@@ -1089,6 +1412,19 @@ async fn main() {
                     }
                 }
                 _ => {}
+            }
+        }
+
+        // Handle keyboard input for boosters (keys 1, 2, 3)
+        if game.state == GameState::Playing {
+            if is_key_pressed(KeyCode::Key1) {
+                game.activate_booster(0);
+            }
+            if is_key_pressed(KeyCode::Key2) {
+                game.activate_booster(1);
+            }
+            if is_key_pressed(KeyCode::Key3) {
+                game.activate_booster(2);
             }
         }
 

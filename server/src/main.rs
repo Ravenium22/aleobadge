@@ -327,6 +327,23 @@ impl ServerState {
                     }
                 }
             }
+            ClientMessage::ActivateBooster { booster_id } => {
+                if let Some(game_id) = self.player_to_game.read().await.get(&player_id) {
+                    if let Some(game) = self.games.read().await.get(game_id) {
+                        // Notify opponent about booster activation
+                        let opponent_tx = if player_id == game.player1.id {
+                            &game.player2.tx
+                        } else {
+                            &game.player1.tx
+                        };
+
+                        let booster_msg = ServerMessage::OpponentActivatedBooster { booster_id };
+                        let _ = opponent_tx.send(Message::Text(
+                            serde_json::to_string(&booster_msg).unwrap()
+                        ));
+                    }
+                }
+            }
             ClientMessage::LeaveGame => {
                 self.remove_player(player_id).await;
             }
