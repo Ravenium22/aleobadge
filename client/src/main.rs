@@ -160,6 +160,7 @@ enum GameState {
     WaitingForMatch,
     Playing,
     GameOver,
+    Leaderboard,
 }
 
 #[derive(PartialEq, Clone, Copy)]
@@ -211,6 +212,10 @@ struct Game {
     elo: i32,                  // Player's ELO rating
     wins: u32,                 // Total wins
     losses: u32,               // Total losses
+    bricks: u32,               // Currency: Bricks
+    gold: u32,                 // Currency: Gold
+    leaderboard_data: Vec<(String, i32)>, // Leaderboard data (username, elo)
+    connecting_for_leaderboard: bool, // Flag to track if connecting for leaderboard
 }
 
 impl Game {
@@ -245,6 +250,10 @@ impl Game {
             elo: 1000,
             wins: 0,
             losses: 0,
+            bricks: 0,
+            gold: 0,
+            leaderboard_data: Vec::new(),
+            connecting_for_leaderboard: false,
         };
         game.initialize_board();
         game
@@ -452,28 +461,49 @@ impl Game {
 
     fn handle_server_message(&mut self, msg: ServerMessage) {
         match msg {
-            ServerMessage::AuthAccepted { player_id, username, elo, wins, losses } => {
+            ServerMessage::AuthAccepted { player_id, username, elo, wins, losses, bricks, gold } => {
                 println!("Authentication successful! Welcome {}", username);
                 self.username = username;
                 self.elo = elo;
                 self.wins = wins;
                 self.losses = losses;
-                // Join queue automatically after authentication
-                if let Some(bridge) = &self.network_bridge {
-                    bridge.send(ClientMessage::JoinQueue);
+                self.bricks = bricks;
+                self.gold = gold;
+
+                // Check if we're connecting for leaderboard or for playing
+                if self.connecting_for_leaderboard {
+                    // Request leaderboard data
+                    if let Some(bridge) = &self.network_bridge {
+                        bridge.send(ClientMessage::FetchLeaderboard);
+                    }
+                    self.connecting_for_leaderboard = false;
+                } else {
+                    // Join queue automatically after authentication
+                    if let Some(bridge) = &self.network_bridge {
+                        bridge.send(ClientMessage::JoinQueue);
+                    }
+                    self.state = GameState::WaitingForMatch;
                 }
-                self.state = GameState::WaitingForMatch;
             }
             ServerMessage::AuthRejected { reason } => {
                 println!("Authentication failed: {}", reason);
                 self.disconnect_reason = Some(format!("Auth failed: {}", reason));
                 self.state = GameState::Login;
             }
-            ServerMessage::MatchResult { new_elo, elo_change, wins, losses } => {
+            ServerMessage::MatchResult { new_elo, elo_change, wins, losses, bricks, gold } => {
                 self.elo = new_elo;
                 self.wins = wins;
                 self.losses = losses;
-                println!("Match result: ELO {} ({:+}), W/L: {}/{}", new_elo, elo_change, wins, losses);
+                self.bricks = bricks;
+                self.gold = gold;
+                println!("Match result: ELO {} ({:+}), W/L: {}/{}, Bricks: {}, Gold: {}",
+                    new_elo, elo_change, wins, losses, bricks, gold);
+            }
+            ServerMessage::LeaderboardData { players } => {
+                self.leaderboard_data = players;
+                println!("Received leaderboard data with {} players", self.leaderboard_data.len());
+                // Transition to leaderboard state when data is received
+                self.state = GameState::Leaderboard;
             }
             ServerMessage::Connected { player_id } => {
                 println!("Connected with player ID: {}", player_id);
@@ -1330,6 +1360,7 @@ impl Game {
             GameState::WaitingForMatch => self.draw_waiting(),
             GameState::Playing => self.draw_game(),
             GameState::GameOver => self.draw_game_over(),
+            GameState::Leaderboard => self.draw_leaderboard(),
         }
     }
 
@@ -1365,11 +1396,17 @@ impl Game {
         draw_rectangle(online_x, online_y, 200.0, 50.0, BLUE);
         draw_text("ONLINE MODE", online_x + 25.0, online_y + 33.0, 25.0, WHITE);
 
+        // Leaderboard button
+        let leaderboard_x = screen_width / 2.0 - 100.0;
+        let leaderboard_y = screen_height / 2.0 + 120.0;
+        draw_rectangle(leaderboard_x, leaderboard_y, 200.0, 50.0, Color::from_rgba(200, 100, 255, 255));
+        draw_text("LEADERBOARD", leaderboard_x + 25.0, leaderboard_y + 33.0, 25.0, WHITE);
+
         // Instructions
         draw_text(
             "Match 3+ gems | Double-tap specials",
             screen_width / 2.0 - 150.0,
-            screen_height / 2.0 + 130.0,
+            screen_height / 2.0 + 190.0,
             18.0,
             LIGHTGRAY,
         );
@@ -1501,6 +1538,27 @@ impl Game {
         draw_rectangle(energy_x, energy_y, filled_width, energy_height, Color::from_rgba(255, 200, 0, 255));
         draw_rectangle_lines(energy_x, energy_y, energy_width, energy_height, 2.0, WHITE);
         draw_text(&format!("Energy: {}/100", self.energy), energy_x, energy_y - 5.0, 18.0, WHITE);
+
+        // Resource HUD (Bricks and Gold) - displayed next to energy
+        let resource_x = energy_x + energy_width + 30.0;
+        let resource_y = 95.0;
+
+        // Bricks icon and count
+        draw_rectangle(resource_x, resource_y, 25.0, 20.0, Color::from_rgba(180, 100, 50, 255));
+        draw_text(
+            &format!("{}", self.bricks),
+            resource_x + 30.0, resource_y + 16.0,
+            20.0, Color::from_rgba(255, 180, 100, 255)
+        );
+
+        // Gold icon and count
+        let gold_x = resource_x + 100.0;
+        draw_circle(gold_x + 12.0, resource_y + 10.0, 10.0, Color::from_rgba(255, 215, 0, 255));
+        draw_text(
+            &format!("{}", self.gold),
+            gold_x + 30.0, resource_y + 16.0,
+            20.0, Color::from_rgba(255, 215, 0, 255)
+        );
 
         // Booster HUD (right side)
         let booster_start_x = screen_width() - 250.0;
@@ -1816,6 +1874,97 @@ impl Game {
             WHITE
         );
     }
+
+    fn draw_leaderboard(&self) {
+        let screen_width = screen_width();
+        let screen_height = screen_height();
+
+        draw_text(
+            "LEADERBOARD - TOP 10",
+            screen_width / 2.0 - 180.0,
+            80.0,
+            40.0,
+            WHITE,
+        );
+
+        // Display leaderboard data
+        let start_y = 150.0;
+        let row_height = 50.0;
+
+        if self.leaderboard_data.is_empty() {
+            draw_text(
+                "No leaderboard data available.",
+                screen_width / 2.0 - 150.0,
+                start_y,
+                25.0,
+                LIGHTGRAY,
+            );
+            draw_text(
+                "Connect to online mode to view rankings.",
+                screen_width / 2.0 - 200.0,
+                start_y + 40.0,
+                20.0,
+                GRAY,
+            );
+        } else {
+            for (i, (username, elo)) in self.leaderboard_data.iter().enumerate() {
+                let y = start_y + i as f32 * row_height;
+
+                // Background for each row
+                let bg_color = if i % 2 == 0 {
+                    Color::from_rgba(40, 40, 70, 255)
+                } else {
+                    Color::from_rgba(30, 30, 60, 255)
+                };
+                draw_rectangle(
+                    screen_width / 2.0 - 250.0,
+                    y - 35.0,
+                    500.0,
+                    45.0,
+                    bg_color
+                );
+
+                // Rank
+                let rank_color = match i {
+                    0 => Color::from_rgba(255, 215, 0, 255),  // Gold
+                    1 => Color::from_rgba(192, 192, 192, 255), // Silver
+                    2 => Color::from_rgba(205, 127, 50, 255),  // Bronze
+                    _ => WHITE,
+                };
+                draw_text(
+                    &format!("#{}", i + 1),
+                    screen_width / 2.0 - 230.0,
+                    y,
+                    30.0,
+                    rank_color,
+                );
+
+                // Username
+                draw_text(
+                    username,
+                    screen_width / 2.0 - 150.0,
+                    y,
+                    28.0,
+                    WHITE,
+                );
+
+                // ELO
+                draw_text(
+                    &format!("{} ELO", elo),
+                    screen_width / 2.0 + 100.0,
+                    y,
+                    28.0,
+                    YELLOW,
+                );
+            }
+        }
+
+        // Back button
+        let back_x = screen_width / 2.0 - 100.0;
+        let back_y = screen_height - 100.0;
+        draw_rectangle(back_x, back_y, 200.0, 50.0, Color::from_rgba(100, 100, 100, 255));
+        draw_text("BACK TO MENU", back_x + 25.0, back_y + 33.0, 25.0, WHITE);
+    }
 }
 
 #[derive(Clone)]
@@ -1968,6 +2117,29 @@ async fn main() {
                         game.state = GameState::Login;
                         game.pending_username.clear();
                         game.disconnect_reason = None;
+                    }
+
+                    // Leaderboard button
+                    let leaderboard_x = screen_width / 2.0 - 100.0;
+                    let leaderboard_y = screen_height / 2.0 + 120.0;
+                    if mouse_x >= leaderboard_x && mouse_x <= leaderboard_x + 200.0
+                        && mouse_y >= leaderboard_y && mouse_y <= leaderboard_y + 50.0 {
+                        game.connecting_for_leaderboard = true;
+                        game.state = GameState::Login;
+                        game.pending_username.clear();
+                        game.disconnect_reason = None;
+                    }
+                }
+                GameState::Leaderboard => {
+                    let screen_width = screen_width();
+                    let screen_height = screen_height();
+
+                    // Back button
+                    let back_x = screen_width / 2.0 - 100.0;
+                    let back_y = screen_height - 100.0;
+                    if mouse_x >= back_x && mouse_x <= back_x + 200.0
+                        && mouse_y >= back_y && mouse_y <= back_y + 50.0 {
+                        game.state = GameState::Menu;
                     }
                 }
                 GameState::Login => {

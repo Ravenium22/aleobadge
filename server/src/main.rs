@@ -133,12 +133,16 @@ impl GameSession {
                     elo_change: p1_elo_change,
                     wins: p1_updated.wins,
                     losses: p1_updated.losses,
+                    bricks: p1_updated.bricks,
+                    gold: p1_updated.gold,
                 };
                 let p2_result_msg = ServerMessage::MatchResult {
                     new_elo: p2_updated.elo,
                     elo_change: p2_elo_change,
                     wins: p2_updated.wins,
                     losses: p2_updated.losses,
+                    bricks: p2_updated.bricks,
+                    gold: p2_updated.gold,
                 };
 
                 let _ = p1_tx.send(Message::Text(serde_json::to_string(&p1_result_msg).unwrap()));
@@ -377,6 +381,15 @@ impl ServerState {
             ClientMessage::JoinQueue => {
                 self.join_queue(player_id).await;
             }
+            ClientMessage::FetchLeaderboard => {
+                // Fetch leaderboard from database and send to client
+                if let Ok(leaderboard) = self.db.get_leaderboard().await {
+                    if let Some(player) = self.players.read().await.get(&player_id) {
+                        let msg = ServerMessage::LeaderboardData { players: leaderboard };
+                        let _ = player.tx.send(Message::Text(serde_json::to_string(&msg).unwrap()));
+                    }
+                }
+            }
             ClientMessage::SwapGems { row1, col1, row2, col2 } => {
                 if let Some(game_id) = self.player_to_game.read().await.get(&player_id) {
                     if let Some(game) = self.games.read().await.get(game_id) {
@@ -484,6 +497,8 @@ async fn handle_connection(
                                     elo: user.elo,
                                     wins: user.wins,
                                     losses: user.losses,
+                                    bricks: user.bricks,
+                                    gold: user.gold,
                                 };
                                 let auth_json = serde_json::to_string(&auth_msg).unwrap();
                                 if ws_sender.send(Message::Text(auth_json)).await.is_err() {

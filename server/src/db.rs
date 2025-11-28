@@ -8,6 +8,8 @@ pub struct User {
     pub elo: i32,
     pub wins: u32,
     pub losses: u32,
+    pub bricks: u32,
+    pub gold: u32,
 }
 
 #[derive(Clone)]
@@ -30,6 +32,8 @@ impl Database {
                 elo INTEGER DEFAULT 1000,
                 wins INTEGER DEFAULT 0,
                 losses INTEGER DEFAULT 0,
+                bricks INTEGER DEFAULT 0,
+                gold INTEGER DEFAULT 0,
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP
             )
             "#,
@@ -45,7 +49,7 @@ impl Database {
     pub async fn get_or_create_user(&self, username: &str) -> Result<User, sqlx::Error> {
         // Try to get existing user first
         let existing = sqlx::query(
-            "SELECT id, username, elo, wins, losses FROM users WHERE username = ?"
+            "SELECT id, username, elo, wins, losses, bricks, gold FROM users WHERE username = ?"
         )
         .bind(username)
         .fetch_optional(&self.pool)
@@ -61,6 +65,8 @@ impl Database {
                 elo: row.get("elo"),
                 wins: row.get("wins"),
                 losses: row.get("losses"),
+                bricks: row.get("bricks"),
+                gold: row.get("gold"),
             });
         }
 
@@ -69,7 +75,7 @@ impl Database {
         let id_str = new_id.to_string();
 
         sqlx::query(
-            "INSERT INTO users (id, username, elo, wins, losses) VALUES (?, ?, 1000, 0, 0)"
+            "INSERT INTO users (id, username, elo, wins, losses, bricks, gold) VALUES (?, ?, 1000, 0, 0, 0, 0)"
         )
         .bind(&id_str)
         .bind(username)
@@ -84,10 +90,12 @@ impl Database {
             elo: 1000,
             wins: 0,
             losses: 0,
+            bricks: 0,
+            gold: 0,
         })
     }
 
-    /// Update match result with ELO calculation
+    /// Update match result with ELO calculation and resource rewards
     pub async fn update_match_result(
         &self,
         winner_id: Uuid,
@@ -107,25 +115,38 @@ impl Database {
             calculate_elo_change(winner.elo, loser.elo, 1.0)
         };
 
+        // Calculate resource rewards
+        let (winner_bricks, winner_gold, loser_bricks, loser_gold) = if is_tie {
+            // Tie: +50 Bricks, +5 Gold for both
+            (50, 5, 50, 5)
+        } else {
+            // Winner: +100 Bricks, +10 Gold | Loser: +25 Bricks
+            (100, 10, 25, 0)
+        };
+
         // Start transaction
         let mut tx = self.pool.begin().await?;
 
         // Update winner
         sqlx::query(
-            "UPDATE users SET elo = ?, wins = wins + ? WHERE id = ?"
+            "UPDATE users SET elo = ?, wins = wins + ?, bricks = bricks + ?, gold = gold + ? WHERE id = ?"
         )
         .bind(winner_new_elo)
         .bind(if is_tie { 0 } else { 1 })
+        .bind(winner_bricks)
+        .bind(winner_gold)
         .bind(winner_id.to_string())
         .execute(&mut *tx)
         .await?;
 
         // Update loser
         sqlx::query(
-            "UPDATE users SET elo = ?, losses = losses + ? WHERE id = ?"
+            "UPDATE users SET elo = ?, losses = losses + ?, bricks = bricks + ?, gold = gold + ? WHERE id = ?"
         )
         .bind(loser_new_elo)
         .bind(if is_tie { 0 } else { 1 })
+        .bind(loser_bricks)
+        .bind(loser_gold)
         .bind(loser_id.to_string())
         .execute(&mut *tx)
         .await?;
@@ -143,7 +164,7 @@ impl Database {
     /// Get user by ID
     async fn get_user_by_id(&self, id: Uuid) -> Result<User, sqlx::Error> {
         let row = sqlx::query(
-            "SELECT id, username, elo, wins, losses FROM users WHERE id = ?"
+            "SELECT id, username, elo, wins, losses, bricks, gold FROM users WHERE id = ?"
         )
         .bind(id.to_string())
         .fetch_one(&self.pool)
@@ -158,7 +179,26 @@ impl Database {
             elo: row.get("elo"),
             wins: row.get("wins"),
             losses: row.get("losses"),
+            bricks: row.get("bricks"),
+            gold: row.get("gold"),
         })
+    }
+
+    /// Get top 10 players by ELO for leaderboard
+    pub async fn get_leaderboard(&self) -> Result<Vec<(String, i32)>, sqlx::Error> {
+        let rows = sqlx::query(
+            "SELECT username, elo FROM users ORDER BY elo DESC LIMIT 10"
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        let leaderboard = rows.iter().map(|row| {
+            let username: String = row.get("username");
+            let elo: i32 = row.get("elo");
+            (username, elo)
+        }).collect();
+
+        Ok(leaderboard)
     }
 }
 
