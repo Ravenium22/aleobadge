@@ -1,0 +1,177 @@
+# Brick City UI Assets Manifest
+# SVG icons, backgrounds, and UI elements for the bright, friendly casual game theme
+
+# ICONS - Outline Style (24x24dp)
+# For navigation, settings, and UI actions
+outline_icons:
+  - settings_outline.svg        # Settings/preferences icon
+  - sound_outline.svg           # Sound effects toggle
+  - music_outline.svg           # Background music toggle
+  - vibration_outline.svg       # Haptic feedback toggle
+  - shop_outline.svg            # In-game shop
+  - map_outline.svg             # World map / city view
+  - home_outline.svg            # Home / main menu
+  - play_outline.svg            # Play button
+  - pause_outline.svg           # Pause button
+  - back_outline.svg            # Back navigation
+  - close_outline.svg           # Close / dismiss
+  - info_outline.svg            # Information / help
+  - leaderboard_outline.svg     # Leaderboard / rankings
+  - trophy_outline.svg          # Achievements
+  - gift_outline.svg            # Rewards / gifts
+  - calendar_outline.svg        # Daily rewards / events
+
+# ICONS - Filled Style (24x24dp)
+# For in-game elements and rewards
+filled_icons:
+  - star_filled.svg             # Star rating / favorite
+  - crown_filled.svg            # Premium / VIP status
+  - trophy_filled.svg           # Victory / achievement
+  - heart_filled.svg            # Lives / health
+  - lightning_filled.svg        # Energy / power
+  - gem_filled.svg              # Premium currency (gems)
+  - coin_filled.svg             # Standard currency (coins)
+  - key_filled.svg              # Unlock / access
+  - chest_filled.svg            # Treasure / loot box
+  - check_filled.svg            # Success / complete
+  - cross_filled.svg            # Error / cancel
+  - shield_filled.svg           # Protection / defense
+  - hammer_filled.svg           # Power-up / tool
+  - bomb_filled.svg             # Explosive power-up
+
+# BACKGROUNDS (Various sizes)
+# Use 1x/2x/3x variants for different screen densities
+backgrounds:
+  - gradient_sky.png            # Blue sky gradient (1125x2436 @1x)
+  - soft_clouds.png             # Cloud texture overlay (transparent PNG)
+  - card_paper.9.png            # 9-patch card background texture
+  - ui_shadow.png               # Soft drop shadow for elevated elements
+  - sparkle_particle.png        # Sparkle effect particle
+  - glow_radial.png             # Radial glow effect
+
+# BUTTON STATES (SVG or PNG with transparency)
+# For glossy, polished button appearance
+button_assets:
+  - button_gloss_overlay.svg    # Glossy specular highlight overlay
+  - button_inner_shadow.svg     # Subtle inner shadow for depth
+
+# UI DECORATIONS
+decorations:
+  - corner_ornament_tl.svg      # Top-left corner decoration
+  - corner_ornament_tr.svg      # Top-right corner decoration
+  - divider_ornate.svg          # Decorative divider line
+  - ribbon_premium.svg          # Premium ribbon badge
+
+# DESIGN SPECIFICATIONS
+# These are guidelines for artists/designers creating the assets
+
+design_specs:
+  icon_size: 24x24dp (72x72px @3x)
+  icon_stroke_width: 2px
+  icon_style: Rounded, friendly, simple
+  icon_colors: Use single color (will be tinted programmatically)
+
+  background_sizes:
+    1x: 1125x2436px (iPhone X/11 Pro)
+    2x: 2250x4872px
+    3x: 3375x7308px
+
+  color_palette:
+    gold: "#FFD700"
+    blue: "#2196F3"
+    green: "#32CD32"
+    red: "#FF3D3D"
+    purple: "#BA55D3"
+
+  corner_radii:
+    xs: 8dp
+    sm: 12dp
+    md: 16dp
+    lg: 20dp
+    xl: 28dp
+    2xl: 36dp
+
+  shadows:
+    card: "0 2dp 6dp rgba(0,0,0,0.08)"
+    button: "0 4dp 8dp rgba(0,0,0,0.15)"
+    chip: "0 2dp 4dp rgba(0,0,0,0.06)"
+
+# USAGE NOTES
+#
+# All SVG icons should be:
+# - Single-color (will use ColorFilter for tinting)
+# - 24x24dp artboard with 2dp padding
+# - Exported with viewBox="0 0 24 24"
+# - Optimized with SVGO
+# - Path-based (no text elements)
+#
+# All PNG backgrounds should have:
+# - @1x, @2x, @3x variants in respective folders
+# - Transparent backgrounds where applicable
+# - Optimized with pngquant or similar
+#
+# 9-patch backgrounds (.9.png):
+# - Follow Android 9-patch format
+# - 1px black border for stretch/content regions
+# - Optimized for performance
+
+# IMPLEMENTATION
+#
+# In Flutter code:
+#
+# import 'package:flutter_svg/flutter_svg.dart';
+#
+# // SVG Icon
+# SvgPicture.asset(
+#   'assets/ui/icons/star_filled.svg',
+#   width: 24,
+#   height: 24,
+#   colorFilter: ColorFilter.mode(
+#     tokens.gold,
+#     BlendMode.srcIn,
+#   ),
+# )
+#
+# // PNG Background
+# Image.asset(
+#   'assets/ui/backgrounds/gradient_sky.png',
+#   fit: BoxFit.cover,
+# )
+#
+# // 9-patch (requires custom package or platform views)
+
+# FILE STRUCTURE
+#
+# assets/ui/
+# ├── icons/
+# │   ├── settings_outline.svg
+# │   ├── star_filled.svg
+# │   └── ...
+# ├── backgrounds/
+# │   ├── 1x/
+# │   │   └── gradient_sky.png
+# │   ├── 2x/
+# │   │   └── gradient_sky.png
+# │   └── 3x/
+# │       └── gradient_sky.png
+# └── ui_assets.yaml (this file)
+
+# PRIORITY ICONS FOR MVP
+# Start with these essential icons first:
+mvp_priority:
+  - play_outline.svg
+  - pause_outline.svg
+  - settings_outline.svg
+  - sound_outline.svg
+  - music_outline.svg
+  - close_outline.svg
+  - back_outline.svg
+  - star_filled.svg
+  - coin_filled.svg
+  - gem_filled.svg
+  - lightning_filled.svg
+  - heart_filled.svg
+
+# PLACEHOLDER ASSETS
+# For development, you can use Material Icons or cupertino_icons
+# Replace with custom SVGs before production launch
